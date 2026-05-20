@@ -1,0 +1,37 @@
+# --- Web framework ---
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+pydantic==2.10.3
+pydantic-settings==2.7.0
+python-multipart==0.0.20
+
+# --- DB ---
+SQLAlchemy==2.0.36
+psycopg2-binary==2.9.10
+alembic==1.14.0
+
+# --- Auth (Phase 5) ---
+passlib[bcrypt]==1.7.4
+python-jose[cryptography]==3.3.0
+
+# --- Data layer ---
+pybaseball==2.2.7
+pandas==2.2.3
+numpy==1.26.4
+pyarrow==18.1.0
+httpx==0.28.1
+tenacity==9.0.0
+
+# --- Analysis (Phase 2) ---
+scikit-learn==1.5.2
+ruptures==1.1.9
+shap==0.46.0
+scipy==1.14.1
+
+# --- Scheduling (Phase 5) ---
+apscheduler==3.11.0
+
+# --- Dev / tests ---
+pytest==8.3.4
+pytest-asyncio==0.25.0
+httpx==0.28.1

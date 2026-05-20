@@ -1,0 +1,64 @@
+# Render blueprint for DiamondScope.
+# Push to GitHub, then in Render: New + > Blueprint > pick this repo.
+# Render reads this file and provisions all three services in one go.
+#
+# Free-tier notes:
+#   - Web services on the free plan sleep after 15 minutes of inactivity; first
+#     request after sleep is slow. Upgrade api/web to "starter" ($7/mo each) if
+#     you want them always-on.
+#   - The persistent disk attached to `api` keeps the Parquet cache across
+#     deploys. Disks require a paid plan ($1/mo for 1 GB). The free Postgres
+#     instance is wiped after 90 days — back up if it matters.
+
+databases:
+  - name: diamondscope-db
+    plan: free
+    databaseName: diamondscope
+    user: diamondscope
+
+services:
+  - type: web
+    name: diamondscope-api
+    runtime: docker
+    plan: free
+    rootDir: backend
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: diamondscope-db
+          property: connectionString
+      - key: CORS_ORIGINS
+        sync: false   # set in Render dashboard to your web service URL
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_ALGORITHM
+        value: HS256
+      - key: JWT_EXPIRE_MINUTES
+        value: "720"
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: CACHE_DIR
+        value: /var/cache/diamondscope
+      - key: DEFAULT_SEASON_WINDOW
+        value: "6"
+    disk:
+      name: cache
+      mountPath: /var/cache/diamondscope
+      sizeGB: 1
+
+  - type: web
+    name: diamondscope-web
+    runtime: node
+    plan: free
+    rootDir: frontend
+    buildCommand: npm ci && npm run build
+    startCommand: npx vite preview --host 0.0.0.0 --port $PORT
+    autoDeploy: true
+    envVars:
+      - key: VITE_API_BASE_URL
+        sync: false   # set to the diamondscope-api URL
