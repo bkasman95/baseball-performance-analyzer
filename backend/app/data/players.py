@@ -190,19 +190,53 @@ def get_player_by_mlbam(mlbam_id: int, *, with_role_detection: bool = True) -> P
 # ---------------------------------------------------------------------------
 
 def _attach_role(p: Player) -> Player:
-    # Inferred from recent leaderboard membership. Cheap: leaderboards are cached.
-    from app.data.aggregates import _seasons_player_appears_in  # local import to avoid cycle
+    """Determine pitcher / hitter / two_way from Statcast pitch volume.
 
-    year = p.last_year or datetime.utcnow().year
-    seasons = list(range(max(2015, year - 2), year + 1))
-    appears_batting = _seasons_player_appears_in(p.mlbam_id, seasons, "batting")
-    appears_pitching = _seasons_player_appears_in(p.mlbam_id, seasons, "pitching")
+    We previously inferred this from FanGraphs batting/pitching leaderboards,
+    but FanGraphs blocks many cloud IPs (e.g. Render) so that path is
+    unreliable. Statcast (Baseball Savant) is the official MLB feed and
+    doesn't block — and a player who pitches in MLB will have thousands of
+    pitcher events; a player who hits will have hundreds of batter events.
 
-    if appears_batting and appears_pitching:
+    Probes the most recent year first, then falls back through 2 prior
+    years in case the current season hasn't started or the player was
+    inactive. Caches under the same Parquet layer the analysis uses, so
+    the second analysis call hits the cache and is instant.
+    """
+    from app.data.statcast import get_statcast  # local import: avoid cycle
+
+    _PITCHER_THRESHOLD = 100  # pitches thrown in a season
+    _HITTER_THRESHOLD = 100   # pitches seen as a batter in a season
+
+    end_year = p.last_year or datetime.utcnow().year
+    start_year = max(2015, end_year - 2)
+
+    is_pitcher = False
+    is_hitter = False
+
+    for year in range(end_year, start_year - 1, -1):
+        if not is_pitcher:
+            try:
+                pdf = get_statcast(p.mlbam_id, "pitcher", year)
+                if not pdf.empty and len(pdf) >= _PITCHER_THRESHOLD:
+                    is_pitcher = True
+            except Exception as e:
+                log.debug("statcast_pitcher probe failed for %s/%s: %s", p.mlbam_id, year, e)
+        if not is_hitter:
+            try:
+                bdf = get_statcast(p.mlbam_id, "hitter", year)
+                if not bdf.empty and len(bdf) >= _HITTER_THRESHOLD:
+                    is_hitter = True
+            except Exception as e:
+                log.debug("statcast_batter probe failed for %s/%s: %s", p.mlbam_id, year, e)
+        if is_pitcher and is_hitter:
+            break
+
+    if is_pitcher and is_hitter:
         p.role = "two_way"
-    elif appears_pitching:
+    elif is_pitcher:
         p.role = "pitcher"
-    elif appears_batting:
+    elif is_hitter:
         p.role = "hitter"
     else:
         p.role = "unknown"
