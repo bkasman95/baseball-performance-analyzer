@@ -16,8 +16,10 @@ from typing import Literal
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
-from app.analysis import build_report
-from app.analysis.metrics import get_metric
+# NOTE: heavy ML imports (app.analysis -> scikit-learn / shap / ruptures) are
+# resolved lazily inside the analysis paths below. Keeping them off the cold
+# import path lets the API stay under tight memory ceilings (e.g. Render's
+# 512 MB free tier) for search / profile / timeseries traffic.
 from app.auth.dependencies import get_current_user
 from app.api.schemas import (
     AnalysisAccepted,
@@ -122,6 +124,10 @@ def _analysis_key(mlbam_id: int, role: str, season: int) -> str:
 
 def _run_analysis(mlbam_id: int, role: str, season: int, seasons_window: int) -> dict:
     """Wrapper that the job runner invokes. Returns a JSON-able dict."""
+    # Lazy import so sklearn / shap / ruptures only load when an analysis
+    # actually runs — not during cold-start of every API worker.
+    from app.analysis import build_report
+
     report = build_report(
         player_id=mlbam_id,
         role=role,                # type: ignore[arg-type]
@@ -204,6 +210,10 @@ def metric_timeseries(
     if p is None:
         raise HTTPException(status_code=404, detail=f"player not found: {mlbam_id}")
     role = p.role if p.role in ("pitcher", "hitter") else "hitter"
+
+    # Lazy import — keeps the analysis metric catalog (and indirectly the
+    # heavier analysis chain) off the cold import path.
+    from app.analysis.metrics import get_metric
 
     m = get_metric(role, metric)
     if m is None:

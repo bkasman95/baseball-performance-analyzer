@@ -71,10 +71,14 @@ def client(monkeypatch, auth_header):
     monkeypatch.setattr("app.api.players.get_league_season", _league_panel)
     monkeypatch.setattr("app.api.players.invalidate", lambda prefix: 3)
 
-    # Have the analysis builder use the same stubs.
+    # Have the analysis builder use the same stubs. players._run_analysis
+    # lazy-imports app.analysis.build_report, so we patch it on that module.
+    # Import the underlying implementation directly so the stub can call it
+    # without recursing into the monkeypatched name.
+    from app.analysis.report import build_report as _real_build_report
+
     def _build_report_stub(*, player_id, role, season, seasons_window=6, **_kw):
-        from app.analysis import build_report as real_build
-        return real_build(
+        return _real_build_report(
             player_id=player_id,
             role=role,
             season=season,
@@ -84,7 +88,8 @@ def client(monkeypatch, auth_header):
             fetch_league_panel=lambda r, s: _league_panel(r, s),
         )
 
-    monkeypatch.setattr("app.api.players.build_report", _build_report_stub)
+    import app.analysis as analysis_module
+    monkeypatch.setattr(analysis_module, "build_report", _build_report_stub)
 
     reset_registry_for_tests()
     from app.main import app
