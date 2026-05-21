@@ -44,13 +44,26 @@ _WOBA_WEIGHTS = {
 _CFIP = 3.10  # league-average FIP constant; approximation
 
 
-_OUT_EVENTS = {
-    "strikeout", "strikeout_double_play",
-    "field_out", "force_out", "fielders_choice", "fielders_choice_out",
-    "grounded_into_double_play", "double_play", "triple_play",
-    "sac_fly", "sac_bunt", "sac_fly_double_play", "sac_bunt_double_play",
-    "other_out",
+# Number of outs each terminal PA event contributes. Multi-out events are
+# critical for IP: a season with 20 GIDPs is ~6-7 IP we'd otherwise miss,
+# which propagates 2-3% errors into WHIP / FIP / HR/9.
+_OUT_EVENT_WEIGHTS: dict[str, int] = {
+    "strikeout":                   1,
+    "field_out":                   1,
+    "force_out":                   1,
+    "fielders_choice":             1,
+    "fielders_choice_out":         1,
+    "sac_fly":                     1,
+    "sac_bunt":                    1,
+    "other_out":                   1,
+    "double_play":                 2,
+    "grounded_into_double_play":   2,
+    "strikeout_double_play":       2,
+    "sac_fly_double_play":         2,
+    "sac_bunt_double_play":        2,
+    "triple_play":                 3,
 }
+_OUT_EVENTS = frozenset(_OUT_EVENT_WEIGHTS)
 _FB_PITCH_TYPES = {"FF", "FT", "SI", "FA"}
 _SL_PITCH_TYPES = {"SL", "ST", "SV"}        # slider, sweeper, slurve
 _CB_PITCH_TYPES = {"CU", "KC", "CS"}        # curveball, knuckle curve, slow curve
@@ -59,10 +72,6 @@ _CH_PITCH_TYPES = {"CH", "FS", "FO"}        # changeup, splitter, forkball
 
 def _count(series: pd.Series, value: str) -> int:
     return int((series == value).sum())
-
-
-def _count_in(series: pd.Series, values: set[str]) -> int:
-    return int(series.isin(values).sum())
 
 
 def _pa_total(df: pd.DataFrame) -> int:
@@ -109,10 +118,10 @@ def aggregate_pitcher_season(df: pd.DataFrame) -> dict[str, float | None]:
     sac_fly = _count(events, "sac_fly")
 
     ab = max(pa - bb - hbp - sac, 0)
-    outs = _count_in(events, _OUT_EVENTS)
-    # Approximation: each out advances IP by 1/3. PAs that end in any kind
-    # of out — including ones not in our explicit set — round out to "not a
-    # baserunner", so as a safety net we also derive outs as: PA - (hits + bb + hbp).
+    # Each terminal event contributes 1, 2, or 3 outs (see _OUT_EVENT_WEIGHTS).
+    outs = int(events.map(_OUT_EVENT_WEIGHTS).fillna(0).sum())
+    # Safety net for any out-events not in the weight map: count any PA that
+    # didn't reach base as at least 1 out.
     implied_outs = max(pa - (hits + bb + hbp), 0)
     outs = max(outs, implied_outs)
     ip = outs / 3.0 if outs else 0.0
@@ -403,13 +412,27 @@ def aggregate_hitter_season(df: pd.DataFrame) -> dict[str, float | None]:
 # ---------------------------------------------------------------------------
 
 def _barrel_rate(batted: pd.DataFrame) -> float | None:
-    """Approximation of Statcast 'Barrel'. The real definition is a piecewise
-    EV-vs-LA window; we use a tight central window which is fine for tracking
-    YoY shifts in a single player's profile.
+    """Approximation of Statcast 'Barrel'.
+
+    Statcast's definition is a piecewise EV/LA window that expands with EV:
+      EV  98:  LA 26-30   (range 4°)
+      EV  99:  LA 25-31   (range 6°)
+      EV 100:  LA 24-33   (range 9°)
+      …
+      EV 116:  LA  8-50   (range 42°)
+    Expansion is roughly 1° on each side per +1 mph of EV. That's a close
+    enough approximation to land in the right ballpark — a single fixed
+    98-mph/26-30° window only catches the narrowest tier and misses most
+    real barrels.
     """
     if batted.empty or "launch_angle" not in batted.columns:
         return None
-    barrel = (batted["launch_speed"] >= 98) & batted["launch_angle"].between(26, 30)
+    ev = batted["launch_speed"]
+    la = batted["launch_angle"]
+    expand = (ev - 98).clip(lower=0)
+    la_min = 26 - expand
+    la_max = 30 + expand
+    barrel = (ev >= 98) & (la >= la_min) & (la <= la_max)
     return float(barrel.mean())
 
 
