@@ -272,6 +272,11 @@ function TrendsSection({
     ? [Math.min(...seasonsAnalyzed), Math.max(...seasonsAnalyzed)]
     : undefined;
 
+  // Without an explicit role the timeseries endpoint falls back to "hitter"
+  // for any player whose role table entry is "unknown", which silently makes
+  // pitcher charts look empty (they have ~0 batter PAs since universal-DH).
+  const role = report.role;
+
   return (
     <section className="space-y-6">
       {topMetrics.length > 0 && (
@@ -291,6 +296,7 @@ function TrendsSection({
                   metric={metric}
                   season={season}
                   seasonRange={seasonRange}
+                  role={role}
                 />
               </div>
             ))}
@@ -318,6 +324,7 @@ function TrendsSection({
                     (f.detail?.["changepoint_date"] as string | undefined) ?? null
                   }
                   period={f.period}
+                  role={role}
                 />
               </div>
             ))}
@@ -333,13 +340,15 @@ function SeasonTrend({
   metric,
   season,
   seasonRange,
+  role,
 }: {
   mlbamId: number;
   metric: string;
   season: number;
   seasonRange?: [number, number];
+  role: "pitcher" | "hitter";
 }) {
-  const ts = useTimeseries(mlbamId, metric, { grain: "season" });
+  const ts = useTimeseries(mlbamId, metric, { grain: "season", role });
   const data = (ts.data?.points ?? []).map((p) => ({
     x: typeof p.x === "string" ? Number(p.x) || p.x : p.x,
     y: p.y,
@@ -368,14 +377,16 @@ function RollingTrend({
   season,
   changepointDate,
   period,
+  role,
 }: {
   mlbamId: number;
   metric: string;
   season: number;
   changepointDate: string | null;
   period: string | null;
+  role: "pitcher" | "hitter";
 }) {
-  const ts = useTimeseries(mlbamId, metric, { grain: "rolling", season, window: 30 });
+  const ts = useTimeseries(mlbamId, metric, { grain: "rolling", season, window: 30, role });
   const data = (ts.data?.points ?? []).map((p) => ({ x: p.x, y: p.y }));
   return (
     <TrendChart

@@ -219,19 +219,27 @@ def metric_timeseries(
     season: int | None = Query(None, description="Required when grain=rolling"),
     window: int = Query(30, ge=5, le=200, description="Rolling window size when grain=rolling"),
     seasons_window: int = Query(6, ge=2, le=15),
+    role: Literal["pitcher", "hitter"] | None = Query(
+        None,
+        description=(
+            "Override the player's role. Pass this from the analysis report "
+            "so we don't have to re-detect on every chart fetch (and so "
+            "pitchers aren't accidentally queried as batters)."
+        ),
+    ),
 ) -> TimeseriesResponse:
     p = get_player_by_mlbam(mlbam_id, with_role_detection=False)
     if p is None:
         raise HTTPException(status_code=404, detail=f"player not found: {mlbam_id}")
-    role = p.role if p.role in ("pitcher", "hitter") else "hitter"
+    resolved_role = role or (p.role if p.role in ("pitcher", "hitter") else "hitter")
 
     # Lazy import — keeps the analysis metric catalog (and indirectly the
     # heavier analysis chain) off the cold import path.
     from app.analysis.metrics import get_metric
 
-    m = get_metric(role, metric)
+    m = get_metric(resolved_role, metric)
     if m is None:
-        raise HTTPException(status_code=400, detail=f"unknown metric '{metric}' for {role}")
+        raise HTTPException(status_code=400, detail=f"unknown metric '{metric}' for {resolved_role}")
 
     notes: list[str] = []
     points: list[TimeseriesPoint] = []
@@ -240,7 +248,7 @@ def metric_timeseries(
         end = season or (p.last_year or datetime.utcnow().year)
         seasons = list(range(end - seasons_window + 1, end + 1))
         try:
-            df = get_season_aggregates(mlbam_id, role, seasons)  # type: ignore[arg-type]
+            df = get_season_aggregates(mlbam_id, resolved_role, seasons)  # type: ignore[arg-type]
         except Exception as e:
             log.warning("season aggregates fetch failed for %s: %s", mlbam_id, e)
             df = pd.DataFrame()
@@ -261,12 +269,12 @@ def metric_timeseries(
         if season is None:
             raise HTTPException(status_code=400, detail="season is required when grain=rolling")
         try:
-            sc = get_statcast(mlbam_id, role, season)  # type: ignore[arg-type]
+            sc = get_statcast(mlbam_id, resolved_role, season)  # type: ignore[arg-type]
         except Exception as e:
             log.warning("statcast fetch failed for %s/%s: %s", mlbam_id, season, e)
             sc = pd.DataFrame()
 
-        statcast_col = _rolling_proxy_column(role, metric)
+        statcast_col = _rolling_proxy_column(resolved_role, metric)
         if statcast_col is None:
             notes.append("no_rolling_proxy_for_metric")
         elif sc.empty or statcast_col not in sc.columns:

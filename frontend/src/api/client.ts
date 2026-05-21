@@ -201,7 +201,12 @@ export async function getJob(jobId: string): Promise<JobView> {
 export async function getTimeseries(
   mlbamId: number,
   metric: string,
-  opts?: { grain?: "season" | "rolling"; season?: number; window?: number }
+  opts?: {
+    grain?: "season" | "rolling";
+    season?: number;
+    window?: number;
+    role?: "pitcher" | "hitter";
+  }
 ): Promise<TimeseriesResponse> {
   return (
     await api.get<TimeseriesResponse>(
@@ -212,6 +217,7 @@ export async function getTimeseries(
           grain: opts?.grain ?? "season",
           season: opts?.season,
           window: opts?.window,
+          role: opts?.role,
         },
       }
     )

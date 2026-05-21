@@ -130,15 +130,29 @@ export function useAnalysis(
 export function useTimeseries(
   mlbamId: number | undefined,
   metric: string | undefined,
-  opts?: { grain?: "season" | "rolling"; season?: number; window?: number }
+  opts?: {
+    grain?: "season" | "rolling";
+    season?: number;
+    window?: number;
+    role?: "pitcher" | "hitter";
+  }
 ) {
   return useQuery<TimeseriesResponse>({
-    queryKey: ["timeseries", mlbamId, metric, opts?.grain, opts?.season, opts?.window],
+    queryKey: [
+      "timeseries",
+      mlbamId,
+      metric,
+      opts?.grain,
+      opts?.season,
+      opts?.window,
+      opts?.role,
+    ],
     queryFn: () =>
       getTimeseries(mlbamId!, metric!, {
         grain: opts?.grain ?? "season",
         season: opts?.season,
         window: opts?.window,
+        role: opts?.role,
       }),
     enabled: mlbamId != null && !!metric,
     staleTime: 60_000,
