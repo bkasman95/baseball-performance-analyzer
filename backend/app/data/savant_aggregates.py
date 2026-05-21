@@ -134,7 +134,7 @@ def aggregate_pitcher_season(df: pd.DataFrame) -> dict[str, float | None]:
 
     # FIP and a FIP-shaped ERA proxy (we don't have earned runs in pitch data)
     fip = (((13 * hr) + (3 * (bb + hbp)) - (2 * so)) / ip + _CFIP) if ip else 0.0
-    # xERA — use BIP-level estimated_woba_using_speedangle if present.
+    # xwOBA against — use BIP-level estimated_woba_using_speedangle if present.
     if "estimated_woba_using_speedangle" in df.columns:
         bip = df.dropna(subset=["launch_speed", "estimated_woba_using_speedangle"])
         if not bip.empty:
@@ -145,6 +145,14 @@ def aggregate_pitcher_season(df: pd.DataFrame) -> dict[str, float | None]:
             xwoba = woba
     else:
         xwoba = woba
+
+    # Scale xwOBA-against to the ERA range. Statcast's published xERA uses
+    # proprietary park / league factors we don't have; empirically the
+    # league-wide xwOBA→ERA slope is ~22 ERA points per 0.010 xwOBA. Anchor
+    # the line at (league_avg_xwoba=0.310, league_avg_ERA=4.20). When xwoba
+    # is zero (no data), fall back to FIP so the metric still has a sensible
+    # value.
+    xera = (xwoba - 0.310) * 22.0 + 4.20 if xwoba > 0 else fip
 
     # Contact quality (against)
     batted = df.dropna(subset=["launch_speed"]) if "launch_speed" in df.columns else pd.DataFrame()
@@ -211,7 +219,7 @@ def aggregate_pitcher_season(df: pd.DataFrame) -> dict[str, float | None]:
         # Outcomes
         "ERA":      fip,            # FIP-shaped proxy when earned runs aren't available
         "FIP":      fip,
-        "xERA":     xwoba * 4.5,    # rough mapping; analysis only cares about direction of change
+        "xERA":     xera,
         "xFIP":     fip,            # without league HR/FB rate, fall back to FIP
         "WHIP":     whip,
         "K%":       k_pct,
