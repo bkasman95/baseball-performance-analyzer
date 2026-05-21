@@ -1,13 +1,18 @@
 """Assemble per-player season rows from Baseball Savant's leaderboards.
 
 Savant publishes MLB's official per-season metrics — xERA, xwOBA, Barrel%,
-HardHit%, exit velocity, pitch arsenal, swing decisions — computed with
-proprietary park / league factors we can't replicate. We pull each
-leaderboard once per season (via `leaderboards.get_leaderboard`), then this
-module joins the relevant boards into a single dict for one player-season.
+HardHit%, exit velocity, pitch arsenal — computed with proprietary park /
+league factors we can't replicate.
 
-Anything Savant doesn't publish (FIP, WHIP, BABIP, OBP, …) is filled in
-separately by `savant_aggregates.py` from cached pitch data.
+IMPORTANT: each metric is pulled from THE specific endpoint that publishes
+it as a raw value. We deliberately do NOT touch the `percentile-rankings`
+endpoint, whose columns (xera, k_percent, …) carry 0-100 percentile RANKS,
+not the underlying stats — merging that table on top of `expected_statistics`
+would silently overwrite the real xERA / xBA / xSLG with rank numbers.
+
+Anything Savant doesn't publish as a raw season value (K%, BB%, FIP, WHIP,
+OBP, swing-decision rates, …) is filled in by `savant_aggregates.py` from
+cached pitch-level data.
 """
 
 from __future__ import annotations
@@ -30,8 +35,6 @@ _LB_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="lb-fetch")
 
 
 def _fetch_many(kinds: list[str], year: int, force_refresh: bool) -> dict[str, pd.DataFrame]:
-    """Pull multiple leaderboards for a season in parallel. Each call still
-    goes through `get_leaderboard` so the cache layer is unchanged."""
     futures = {
         kind: _LB_POOL.submit(get_leaderboard, kind, year, force_refresh=force_refresh)  # type: ignore[arg-type]
         for kind in kinds
@@ -47,7 +50,7 @@ def _fetch_many(kinds: list[str], year: int, force_refresh: bool) -> dict[str, p
 
 
 # ---------------------------------------------------------------------------
-# Player-row lookup
+# Helpers
 # ---------------------------------------------------------------------------
 
 _PLAYER_ID_COLS = ("player_id", "playerid", "MLBAMID", "mlbamid", "key_mlbam", "pitcher", "batter")
@@ -86,8 +89,8 @@ def _first_value(d: dict[str, Any], *names: str) -> Any:
 
 def _to_pct(v: Any) -> float | None:
     """Normalize a Savant percent value to a 0-1 ratio. Savant returns these
-    in either 0-100 (e.g. `k_percent=24.7`) or already 0-1 (e.g. `brl_pa=0.063`),
-    depending on the endpoint."""
+    in either 0-100 (e.g. `hard_hit_percent=42.0`) or already 0-1 (e.g.
+    `brl_pa=0.063`), depending on the endpoint."""
     if v is None:
         return None
     try:
@@ -104,64 +107,56 @@ def _to_pct(v: Any) -> float | None:
 # ---------------------------------------------------------------------------
 
 _PITCHER_LEADERBOARD_KINDS = [
-    "pitcher_expected",
-    "pitcher_exitvelo",
-    "pitcher_percentile",
-    "pitcher_arsenal_usage",
-    "pitcher_arsenal_speed",
-    "pitcher_arsenal_spin",
+    "pitcher_expected",          # xBA / xSLG / xwOBA / xERA + actual outcomes
+    "pitcher_exitvelo",          # EV / Barrel% / HardHit% / batted-ball
+    "pitcher_arsenal_usage",     # pitch-mix %
+    "pitcher_arsenal_speed",     # per-pitch avg velocity
+    "pitcher_arsenal_spin",      # per-pitch avg spin
+    # NOTE: pitcher_percentile is intentionally omitted — its columns are
+    # 0-100 percentile RANKS, not raw values.
 ]
 
 
 def assemble_pitcher_season(mlbam_id: int, year: int, *, force_refresh: bool = False) -> dict[str, Any]:
-    """Pull every relevant Savant leaderboard for the season in parallel and
-    return one flat dict for the player. Missing values are simply absent so
-    downstream pitch-derived gap filling has somewhere to land."""
     lbs = _fetch_many(_PITCHER_LEADERBOARD_KINDS, year, force_refresh)
     exp = _row_for_player(lbs["pitcher_expected"], mlbam_id)
     ev  = _row_for_player(lbs["pitcher_exitvelo"], mlbam_id)
-    pct = _row_for_player(lbs["pitcher_percentile"], mlbam_id)
     use = _row_for_player(lbs["pitcher_arsenal_usage"], mlbam_id)
     spd = _row_for_player(lbs["pitcher_arsenal_speed"], mlbam_id)
     spn = _row_for_player(lbs["pitcher_arsenal_spin"], mlbam_id)
-    merged: dict[str, Any] = {**exp, **ev, **pct, **use, **spd, **spn}
-    if not merged:
+    if not any([exp, ev, use, spd, spn]):
         return {}
 
     row: dict[str, Any] = {
-        # --- outcomes (official MLB values) ---
-        "ERA":      _first_value(merged, "era", "p_era"),
-        "xERA":     _first_value(merged, "xera", "p_xera"),
-        "AVG":      _first_value(merged, "ba", "p_ba", "batting_avg"),
-        "xBA":      _first_value(merged, "est_ba", "xba"),
-        "SLG":      _first_value(merged, "slg", "p_slg"),
-        "xSLG":     _first_value(merged, "est_slg", "xslg"),
-        "wOBA":     _first_value(merged, "woba", "p_woba"),
-        "xwOBA":    _first_value(merged, "est_woba", "xwoba"),
-        "K%":       _to_pct(_first_value(merged, "k_percent", "p_k_percent", "k_pct")),
-        "BB%":      _to_pct(_first_value(merged, "bb_percent", "p_bb_percent", "bb_pct")),
-        "HardHit%": _to_pct(_first_value(merged, "hard_hit_percent", "ev95percent")),
-        "Barrel%":  _to_pct(_first_value(merged, "barrel_batted_rate", "brl_percent", "brl_pa")),
-        # --- contact quality (against) ---
-        "EV":       _first_value(merged, "exit_velocity_avg", "avg_hit_speed"),
-        "maxEV":    _first_value(merged, "exit_velocity_max", "max_hit_speed"),
-        "LA":       _first_value(merged, "launch_angle_avg", "avg_hit_angle"),
-        # --- pitch-mix usage (kept as 0-1 ratios for consistency) ---
-        "FB%":      _to_pct(_first_value(merged, "n_ff", "n_fastball")),
-        "SI%":      _to_pct(_first_value(merged, "n_si", "n_sinker")),
-        "SL%":      _to_pct(_first_value(merged, "n_sl", "n_slider")),
-        "CB%":      _to_pct(_first_value(merged, "n_cu", "n_curveball", "n_cukc")),
-        "CH%":      _to_pct(_first_value(merged, "n_ch", "n_changeup")),
-        "FC%":      _to_pct(_first_value(merged, "n_fc", "n_cutter")),
+        # --- expected_statistics: official MLB outcome + xstats ---
+        "ERA":      _first_value(exp, "era"),
+        "xERA":     _first_value(exp, "xera"),
+        "AVG":      _first_value(exp, "ba"),
+        "xBA":      _first_value(exp, "est_ba"),
+        "SLG":      _first_value(exp, "slg"),
+        "xSLG":     _first_value(exp, "est_slg"),
+        "wOBA":     _first_value(exp, "woba"),
+        "xwOBA":    _first_value(exp, "est_woba"),
+        "PA":       _first_value(exp, "pa"),
+        "BIP":      _first_value(exp, "bip"),
+        # --- exitvelo / barrels: official contact-quality stats ---
+        "HardHit%": _to_pct(_first_value(ev, "hard_hit_percent", "ev95percent")),
+        "Barrel%":  _to_pct(_first_value(ev, "barrel_batted_rate", "brl_percent", "brl_pa")),
+        "EV":       _first_value(ev, "exit_velocity_avg", "avg_hit_speed"),
+        "maxEV":    _first_value(ev, "exit_velocity_max", "max_hit_speed"),
+        "LA":       _first_value(ev, "launch_angle_avg", "avg_hit_angle"),
+        # --- arsenal usage (Savant returns 0-100, normalize to 0-1) ---
+        "FB%":      _to_pct(_first_value(use, "n_ff", "n_fastball")),
+        "SI%":      _to_pct(_first_value(use, "n_si", "n_sinker")),
+        "SL%":      _to_pct(_first_value(use, "n_sl", "n_slider")),
+        "CB%":      _to_pct(_first_value(use, "n_cu", "n_curveball", "n_cukc")),
+        "CH%":      _to_pct(_first_value(use, "n_ch", "n_changeup")),
+        "FC%":      _to_pct(_first_value(use, "n_fc", "n_cutter")),
         # --- arsenal velocity / spin ---
-        "FBv":          _first_value(merged, "ff_avg_speed", "fastball_avg_speed", "fb_velocity"),
-        "FBspin (sc)":  _first_value(merged, "ff_avg_spin", "fastball_avg_spin", "fb_spin"),
-        # --- swing decisions ---
-        "O-Swing%":     _to_pct(_first_value(merged, "oz_swing_percent", "chase_percent")),
-        "SwStr%":       _to_pct(_first_value(merged, "swing_miss_percent", "whiff_percent")),
-        # --- sample-size context ---
-        "PA":       _first_value(merged, "pa", "p_pa"),
-        "BIP":      _first_value(merged, "bip", "attempts", "bbe"),
+        "FBv":          _first_value(spd, "ff_avg_speed", "fastball_avg_speed"),
+        "FBspin (sc)":  _first_value(spn, "ff_avg_spin", "fastball_avg_spin"),
+        # K%, BB%, O-Swing%, SwStr%, CSW%, Zone%, F-Strike%, FIP, WHIP, HR/9,
+        # BABIP are all filled in by savant_aggregates.pitcher_gaps_from_pitches.
     }
     return {k: v for k, v in row.items() if v is not None}
 
@@ -173,7 +168,7 @@ def assemble_pitcher_season(mlbam_id: int, year: int, *, force_refresh: bool = F
 _HITTER_LEADERBOARD_KINDS = [
     "batter_expected",
     "batter_exitvelo",
-    "batter_percentile",
+    # batter_percentile omitted for the same reason as pitcher_percentile.
 ]
 
 
@@ -181,41 +176,32 @@ def assemble_hitter_season(mlbam_id: int, year: int, *, force_refresh: bool = Fa
     lbs = _fetch_many(_HITTER_LEADERBOARD_KINDS, year, force_refresh)
     exp = _row_for_player(lbs["batter_expected"], mlbam_id)
     ev  = _row_for_player(lbs["batter_exitvelo"], mlbam_id)
-    pct = _row_for_player(lbs["batter_percentile"], mlbam_id)
-    merged: dict[str, Any] = {**exp, **ev, **pct}
-    if not merged:
+    if not any([exp, ev]):
         return {}
 
     row: dict[str, Any] = {
-        # --- outcomes ---
-        "AVG":      _first_value(merged, "ba", "batting_avg"),
-        "xBA":      _first_value(merged, "est_ba", "xba"),
-        "SLG":      _first_value(merged, "slg"),
-        "xSLG":     _first_value(merged, "est_slg", "xslg"),
-        "wOBA":     _first_value(merged, "woba"),
-        "xwOBA":    _first_value(merged, "est_woba", "xwoba"),
-        "K%":       _to_pct(_first_value(merged, "k_percent", "k_pct")),
-        "BB%":      _to_pct(_first_value(merged, "bb_percent", "bb_pct")),
-        "HardHit%": _to_pct(_first_value(merged, "hard_hit_percent", "ev95percent")),
-        "Barrel%":  _to_pct(_first_value(merged, "barrel_batted_rate", "brl_percent")),
-        # --- contact quality ---
-        "EV":       _first_value(merged, "exit_velocity_avg", "avg_hit_speed"),
-        "maxEV":    _first_value(merged, "exit_velocity_max", "max_hit_speed"),
-        "LA":       _first_value(merged, "launch_angle_avg", "avg_hit_angle"),
-        "SweetSpot%": _to_pct(_first_value(merged, "sweet_spot_percent", "anglesweetspotpercent")),
-        # --- batted-ball profile ---
-        "GB%":      _to_pct(_first_value(merged, "gb_percent", "groundballs_percent")),
-        "FB%":      _to_pct(_first_value(merged, "fb_percent", "flyballs_percent")),
-        "LD%":      _to_pct(_first_value(merged, "ld_percent", "linedrives_percent")),
-        # --- bat tracking ---
-        "avg_bat_speed":    _first_value(merged, "avg_bat_speed", "bat_speed"),
-        "avg_swing_length": _first_value(merged, "avg_swing_length", "swing_length"),
-        # --- swing decisions ---
-        "O-Swing%":     _to_pct(_first_value(merged, "oz_swing_percent", "chase_percent")),
-        "Whiff%":       _to_pct(_first_value(merged, "whiff_percent")),
-        # --- sample size ---
-        "PA":       _first_value(merged, "pa"),
-        "BIP":      _first_value(merged, "bip", "attempts", "bbe"),
+        # --- expected_statistics: actual + xstats ---
+        "AVG":      _first_value(exp, "ba"),
+        "xBA":      _first_value(exp, "est_ba"),
+        "SLG":      _first_value(exp, "slg"),
+        "xSLG":     _first_value(exp, "est_slg"),
+        "wOBA":     _first_value(exp, "woba"),
+        "xwOBA":    _first_value(exp, "est_woba"),
+        "PA":       _first_value(exp, "pa"),
+        "BIP":      _first_value(exp, "bip"),
+        # --- exitvelo: contact-quality + batted-ball profile ---
+        "HardHit%": _to_pct(_first_value(ev, "hard_hit_percent", "ev95percent")),
+        "Barrel%":  _to_pct(_first_value(ev, "barrel_batted_rate", "brl_percent")),
+        "EV":       _first_value(ev, "exit_velocity_avg", "avg_hit_speed"),
+        "maxEV":    _first_value(ev, "exit_velocity_max", "max_hit_speed"),
+        "LA":       _first_value(ev, "launch_angle_avg", "avg_hit_angle"),
+        "SweetSpot%": _to_pct(_first_value(ev, "sweet_spot_percent", "anglesweetspotpercent")),
+        "GB%":      _to_pct(_first_value(ev, "gb_percent", "groundballs_percent")),
+        "FB%":      _to_pct(_first_value(ev, "fb_percent", "flyballs_percent")),
+        "LD%":      _to_pct(_first_value(ev, "ld_percent", "linedrives_percent")),
+        # K%, BB%, OBP, OPS, ISO, BABIP, Whiff%, O-Swing%, Contact%, Z-Contact%,
+        # SwStr%, Bat_speed, Swing_length are filled in by
+        # savant_aggregates.hitter_gaps_from_pitches.
     }
     return {k: v for k, v in row.items() if v is not None}
 

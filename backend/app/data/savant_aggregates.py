@@ -121,6 +121,11 @@ def pitcher_gaps_from_pitches(df: pd.DataFrame) -> dict[str, float | int | None]
     babip_den = ab - so - hr + sac_fly
     babip = (hits - hr) / babip_den if babip_den > 0 else None
 
+    # Per-PA rates — basic counting; not on any Savant leaderboard as raw values.
+    k_pct  = so / pa if pa else None
+    bb_pct = bb / pa if pa else None
+    k_minus_bb = (k_pct - bb_pct) if (k_pct is not None and bb_pct is not None) else None
+
     # Pitch-level rates (these aren't on the season leaderboards as raw values)
     desc = df.get("description", pd.Series(dtype="object"))
     called = _count(desc, "called_strike")
@@ -129,10 +134,20 @@ def pitcher_gaps_from_pitches(df: pd.DataFrame) -> dict[str, float | int | None]
     swstr  = whiff / pitches if pitches else None
 
     zone_pct: float | None = None
+    o_swing_pct: float | None = None
     if "zone" in df.columns:
-        z = pd.to_numeric(df["zone"], errors="coerce").dropna()
-        if not z.empty:
-            zone_pct = float(((z >= 1) & (z <= 9)).mean())
+        z = pd.to_numeric(df["zone"], errors="coerce")
+        z_clean = z.dropna()
+        if not z_clean.empty:
+            zone_pct = float(((z_clean >= 1) & (z_clean <= 9)).mean())
+        # Induced O-Swing% — pitches outside the zone the batter swung at.
+        if "description" in df.columns:
+            outside = df[z >= 10]
+            if not outside.empty:
+                swung = outside["description"].isin([
+                    "swinging_strike", "swinging_strike_blocked", "foul", "foul_tip", "hit_into_play",
+                ])
+                o_swing_pct = float(swung.mean())
 
     f_strike_pct: float | None = None
     if "pitch_number" in df.columns and "type" in df.columns:
@@ -152,15 +167,19 @@ def pitcher_gaps_from_pitches(df: pd.DataFrame) -> dict[str, float | int | None]
         "WHIP":             whip,
         "HR/9":             hr_9,
         "BABIP":            babip,
+        "K%":               k_pct,
+        "BB%":              bb_pct,
+        "K-BB%":            k_minus_bb,
         "CSW%":             csw,
-        "SwStr%":           swstr,    # pitcher-side swstr; leaderboard's pitcher swing_miss_percent will override when present
+        "SwStr%":           swstr,
         "Zone%":            zone_pct,
         "F-Strike%":        f_strike_pct,
+        "O-Swing%":         o_swing_pct,
         "Release_height":   release_h,
         "Release_side":     release_s,
         "Extension":        extension,
         "Pitches":          pitches,
-        "_PA_pitch":        pa,         # for sanity-checking vs leaderboard PA
+        "_PA_pitch":        pa,
     }
 
 
@@ -202,6 +221,9 @@ def hitter_gaps_from_pitches(df: pd.DataFrame) -> dict[str, float | int | None]:
     babip_den = ab - so - hr + sac_fly
     babip = (hits - hr) / babip_den if babip_den > 0 else None
 
+    k_pct  = so / pa if pa else None
+    bb_pct = bb / pa if pa else None
+
     # Plate-discipline rates derivable from pitch descriptions.
     desc = df.get("description", pd.Series(dtype="object"))
     pitches = len(df)
@@ -210,11 +232,20 @@ def hitter_gaps_from_pitches(df: pd.DataFrame) -> dict[str, float | int | None]:
     in_play = _count(desc, "hit_into_play")
     swings = whiff + foul + in_play
     contact_pct = (swings - whiff) / swings if swings else None
+    whiff_pct = whiff / swings if swings else None
     swstr_pct = whiff / pitches if pitches else None
 
+    o_swing_pct: float | None = None
     z_contact_pct: float | None = None
     if "zone" in df.columns:
         z = pd.to_numeric(df["zone"], errors="coerce")
+        if "description" in df.columns:
+            outside = df[z >= 10]
+            if not outside.empty:
+                o_swung = outside["description"].isin([
+                    "swinging_strike", "swinging_strike_blocked", "foul", "foul_tip", "hit_into_play",
+                ])
+                o_swing_pct = float(o_swung.mean())
         inside = df[(z >= 1) & (z <= 9)]
         if not inside.empty:
             iz_swings = inside["description"].isin([
@@ -232,10 +263,14 @@ def hitter_gaps_from_pitches(df: pd.DataFrame) -> dict[str, float | int | None]:
         "OPS":          ops,
         "ISO":          iso,
         "BABIP":        babip,
-        # Slash-line basics too — leaderboard provides AVG/SLG/wOBA already,
-        # but if a player slipped under their minPA threshold, this fills in.
+        "K%":           k_pct,
+        "BB%":          bb_pct,
+        # Slash-line basics too — leaderboard provides AVG/SLG already,
+        # but if a player slipped under the minPA threshold this fills in.
         "AVG":          avg,
         "SLG":          slg,
+        "O-Swing%":     o_swing_pct,
+        "Whiff%":       whiff_pct,
         "Contact%":     contact_pct,
         "Z-Contact%":   z_contact_pct,
         "SwStr%":       swstr_pct,

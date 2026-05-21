@@ -106,18 +106,22 @@ def test_pitcher_gaps_counts_double_plays_as_two_outs():
 
 
 def test_pitcher_gaps_no_leaderboard_metrics_leak():
-    """The gap-derivation must NOT emit ERA, xERA, wOBA, K%, Barrel%, etc. —
-    those belong to the leaderboard layer and would override pitch-derived
-    values if leaked."""
+    """The gap-derivation must NOT emit metrics Savant publishes on a raw-value
+    leaderboard (ERA / xERA / wOBA / xwOBA / Barrel% / HardHit% / EV) — those
+    are sourced from the leaderboard layer. K% / BB% / O-Swing% / SwStr% etc.
+    ARE in this layer because no Savant raw-value endpoint publishes them."""
     rows = [
         _pitch(events="single", description="hit_into_play",
                launch_speed=95.0, launch_angle=15.0, at_bat_number=1, ptype="X"),
     ]
     gaps = pitcher_gaps_from_pitches(pd.DataFrame(rows))
     forbidden = {"ERA", "xERA", "xBA", "xSLG", "wOBA", "xwOBA",
-                 "K%", "BB%", "AVG", "Barrel%", "HardHit%", "EV", "maxEV"}
+                 "AVG", "Barrel%", "HardHit%", "EV", "maxEV"}
     assert forbidden.isdisjoint(gaps.keys()), \
         f"Leaderboard-owned keys leaked: {forbidden & gaps.keys()}"
+    # K% / BB% MUST be here — there's no raw-value Savant leaderboard for them.
+    assert "K%" in gaps
+    assert "BB%" in gaps
 
 
 # ---------------------------------------------------------------------------
@@ -156,16 +160,20 @@ def test_hitter_gaps_slash_line():
 
 
 def test_hitter_gaps_no_leaderboard_metrics_leak():
-    """Hitter gap layer must not emit xwOBA, Barrel%, EV, etc."""
+    """Hitter gap layer must not emit metrics Savant publishes raw (xwOBA,
+    Barrel%, HardHit%, EV). K%/BB% ARE here because no raw-value leaderboard
+    publishes them."""
     rows = [
         _pitch(events="single", description="hit_into_play",
                launch_speed=95.0, launch_angle=15.0, at_bat_number=1, ptype="X"),
     ]
     gaps = hitter_gaps_from_pitches(pd.DataFrame(rows))
     forbidden = {"xwOBA", "xBA", "xSLG", "wOBA",
-                 "K%", "BB%", "Barrel%", "HardHit%", "EV", "maxEV"}
+                 "Barrel%", "HardHit%", "EV", "maxEV"}
     assert forbidden.isdisjoint(gaps.keys()), \
         f"Leaderboard-owned keys leaked: {forbidden & gaps.keys()}"
+    assert "K%" in gaps
+    assert "BB%" in gaps
 
 
 # ---------------------------------------------------------------------------

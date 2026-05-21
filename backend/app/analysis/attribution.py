@@ -263,10 +263,13 @@ def rank_probable_causes(
     rule_drivers = list(rule.drivers) if rule else []
     rule_priority = {name: (len(rule_drivers) - i) / len(rule_drivers) for i, name in enumerate(rule_drivers)} if rule_drivers else {}
 
-    # Composite score:
-    #   0.45 * normalized abs SHAP
-    # + 0.35 * normalized abs standardized delta
-    # + 0.20 * rule_priority (0..1)
+    # Composite score, delta-weighted so the visible movers rank first and
+    # SHAP / domain rules act as tiebreakers. The earlier SHAP-heavy mix
+    # could rank a tiny FB-spin shift above a large release-point change
+    # just because the league model thought spin → ERA was a strong link.
+    #   0.55 * normalized abs standardized delta
+    # + 0.30 * normalized abs SHAP
+    # + 0.15 * rule_priority (0..1)
     abs_shap = {k: abs(v) for k, v in shap_map.items()}
     max_shap = max(abs_shap.values(), default=0.0) or 1.0
     max_delta = max(delta_score.values(), default=0.0) or 1.0
@@ -276,7 +279,7 @@ def rank_probable_causes(
         s_shap = abs_shap.get(metric.name, 0.0) / max_shap
         s_delta = delta_score.get(metric.name, 0.0) / max_delta
         s_rule = rule_priority.get(metric.name, 0.0)
-        score = 0.45 * s_shap + 0.35 * s_delta + 0.20 * s_rule
+        score = 0.55 * s_delta + 0.30 * s_shap + 0.15 * s_rule
         scored.append((score, metric, before, after, raw, std))
 
     scored.sort(key=lambda t: t[0], reverse=True)
