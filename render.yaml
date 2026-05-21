@@ -4,11 +4,17 @@
 #
 # Free-tier notes:
 #   - Web services on the free plan sleep after 15 minutes of inactivity; first
-#     request after sleep is slow. Upgrade api/web to "starter" ($7/mo each) if
-#     you want them always-on.
-#   - The persistent disk attached to `api` keeps the Parquet cache across
-#     deploys. Disks require a paid plan ($1/mo for 1 GB). The free Postgres
-#     instance is wiped after 90 days — back up if it matters.
+#     request after sleep is slow.
+#   - The free plan does NOT support persistent disks. The Parquet cache lives
+#     inside the container and is wiped on every deploy / restart, so the
+#     first player lookup after a deploy will be slow (~30-60 s) while the
+#     data layer re-fetches from FanGraphs / Statcast.
+#   - To get a persistent cache: change the `api` service plan from `free` to
+#     `starter` ($7/mo) and uncomment the `disk:` block at the bottom of this
+#     file ($1/mo for 1 GB).
+#   - The free Postgres instance is wiped after 90 days. Saved analyses and
+#     user accounts will be lost. Use the `starter` Postgres plan ($7/mo) if
+#     you care about persistence.
 
 databases:
   - name: diamondscope-db
@@ -43,13 +49,15 @@ services:
       - key: ADMIN_PASSWORD
         sync: false
       - key: CACHE_DIR
-        value: /var/cache/diamondscope
+        value: /app/cache    # ephemeral on free tier; replace with disk mount when upgrading
       - key: DEFAULT_SEASON_WINDOW
         value: "6"
-    disk:
-      name: cache
-      mountPath: /var/cache/diamondscope
-      sizeGB: 1
+    # To enable persistent cache, upgrade plan: above to `starter` and uncomment:
+    # disk:
+    #   name: cache
+    #   mountPath: /var/cache/diamondscope
+    #   sizeGB: 1
+    # (and change CACHE_DIR to /var/cache/diamondscope)
 
   - type: web
     name: diamondscope-web
