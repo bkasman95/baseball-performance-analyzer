@@ -1,18 +1,19 @@
-"""Season aggregates computed from raw Baseball Savant Statcast pitch data.
+"""Pitch-data derivations for the metrics Savant leaderboards don't publish.
 
-This module replaces the FanGraphs-derived `batting_stats` / `pitching_stats`
-path when FanGraphs is unreachable (e.g. from cloud IPs that they block).
-Savant is MLB's official Statcast operation and serves pitch-level data
-directly — we aggregate it ourselves.
+Most season-level stats (xERA, xwOBA, Barrel%, HardHit%, EV, swing decisions,
+pitch arsenal) come from `savant_leaderboards.py` — MLB computes those
+officially and we shouldn't reinvent them.
 
-Trade-offs vs the FanGraphs path:
-  - More granular: derived from every pitch / event rather than season totals.
-  - Some metrics (xERA, wRC+, park-adjusted figures) require league baselines
-    or park factors that aren't trivially derivable from raw Statcast. We
-    approximate where reasonable and omit otherwise.
-  - Linear weights for wOBA are hard-coded MLB-wide constants. Good enough
-    for anomaly detection (which looks at CHANGES, not absolute values).
-  - FIP uses a fixed cFIP constant. Same caveat.
+What MLB does NOT publish on a leaderboard (or only as a percentile rank,
+not a raw value), we compute here from the cached pitch-level Statcast feed:
+
+  Pitcher gaps : IP, FIP, WHIP, HR/9, BABIP, CSW%, Zone%, F-Strike%,
+                 release height/side, extension, pitch counts
+  Hitter gaps  : OBP, OPS, ISO, BABIP, Z-Contact%, Contact%
+
+All formulas here are exact (no approximations); we own them because they're
+either trivial counting math or pitch-level rollups, not the kind of
+proprietary computation we'd want to second-guess MLB on.
 """
 
 from __future__ import annotations
@@ -29,24 +30,16 @@ Role = Literal["pitcher", "hitter", "batting", "pitching"]
 
 
 # ---------------------------------------------------------------------------
-# Linear weights / constants
+# wOBA linear weights — used only for the BB/HBP credit when we derive OBP
+# / OPS / ISO from raw counts. NOT used for wOBA itself (that comes from the
+# leaderboard).
 # ---------------------------------------------------------------------------
-# These are MLB-wide ~2023 values. Not park- or year-adjusted. Sufficient for
-# detecting year-over-year shifts in a single player's profile.
-_WOBA_WEIGHTS = {
-    "walk":          0.696,
-    "hit_by_pitch":  0.726,
-    "single":        0.882,
-    "double":        1.247,
-    "triple":        1.578,
-    "home_run":      2.005,
-}
-_CFIP = 3.10  # league-average FIP constant; approximation
+
+_CFIP = 3.10  # league-average FIP constant, ~stable across recent seasons
 
 
-# Number of outs each terminal PA event contributes. Multi-out events are
-# critical for IP: a season with 20 GIDPs is ~6-7 IP we'd otherwise miss,
-# which propagates 2-3% errors into WHIP / FIP / HR/9.
+# Outs per terminal-event. Multi-out events matter: GIDPs alone produce
+# ~6-7 IP per season that a "1 out each" treatment would miss.
 _OUT_EVENT_WEIGHTS: dict[str, int] = {
     "strikeout":                   1,
     "field_out":                   1,
@@ -63,11 +56,6 @@ _OUT_EVENT_WEIGHTS: dict[str, int] = {
     "sac_bunt_double_play":        2,
     "triple_play":                 3,
 }
-_OUT_EVENTS = frozenset(_OUT_EVENT_WEIGHTS)
-_FB_PITCH_TYPES = {"FF", "FT", "SI", "FA"}
-_SL_PITCH_TYPES = {"SL", "ST", "SV"}        # slider, sweeper, slurve
-_CB_PITCH_TYPES = {"CU", "KC", "CS"}        # curveball, knuckle curve, slow curve
-_CH_PITCH_TYPES = {"CH", "FS", "FO"}        # changeup, splitter, forkball
 
 
 def _count(series: pd.Series, value: str) -> int:
@@ -75,7 +63,6 @@ def _count(series: pd.Series, value: str) -> int:
 
 
 def _pa_total(df: pd.DataFrame) -> int:
-    """Count distinct plate appearances. Statcast assigns at_bat_number per game."""
     if df.empty:
         return 0
     keys = [c for c in ("game_pk", "at_bat_number") if c in df.columns]
@@ -84,26 +71,31 @@ def _pa_total(df: pd.DataFrame) -> int:
     return int(df.drop_duplicates(keys).shape[0])
 
 
-def _ab_events(df: pd.DataFrame) -> pd.Series:
-    """Return one `events` value per PA — the last pitch of each at-bat carries
-    the outcome in Statcast's schema."""
+def _terminal_events(df: pd.DataFrame) -> pd.Series:
     if df.empty or "events" not in df.columns:
         return pd.Series(dtype="object")
     return df["events"].dropna()
 
 
+def _mean_or_none(series: pd.Series) -> float | None:
+    s = series.dropna()
+    if s.empty:
+        return None
+    return float(s.mean())
+
+
 # ---------------------------------------------------------------------------
-# Pitcher aggregates
+# Pitcher gaps
 # ---------------------------------------------------------------------------
 
-def aggregate_pitcher_season(df: pd.DataFrame) -> dict[str, float | None]:
-    """Compute one season of pitcher aggregates from pitch-level Statcast."""
+def pitcher_gaps_from_pitches(df: pd.DataFrame) -> dict[str, float | int | None]:
+    """Compute the pitcher-side metrics Savant leaderboards don't publish."""
     if df.empty:
         return {}
 
     pitches = len(df)
     pa = _pa_total(df)
-    events = _ab_events(df)
+    events = _terminal_events(df)
 
     so   = _count(events, "strikeout") + _count(events, "strikeout_double_play")
     bb   = _count(events, "walk")
@@ -113,166 +105,77 @@ def aggregate_pitcher_season(df: pd.DataFrame) -> dict[str, float | None]:
     triple = _count(events, "triple")
     hr   = _count(events, "home_run")
     hits = single + double + triple + hr
-
     sac     = _count(events, "sac_fly") + _count(events, "sac_bunt")
     sac_fly = _count(events, "sac_fly")
-
     ab = max(pa - bb - hbp - sac, 0)
-    # Each terminal event contributes 1, 2, or 3 outs (see _OUT_EVENT_WEIGHTS).
+
     outs = int(events.map(_OUT_EVENT_WEIGHTS).fillna(0).sum())
-    # Safety net for any out-events not in the weight map: count any PA that
-    # didn't reach base as at least 1 out.
     implied_outs = max(pa - (hits + bb + hbp), 0)
     outs = max(outs, implied_outs)
     ip = outs / 3.0 if outs else 0.0
 
-    # Rate stats
-    k_pct  = so / pa if pa else 0.0
-    bb_pct = bb / pa if pa else 0.0
-    whip   = (hits + bb) / ip if ip else 0.0
-    hr_9   = (hr / ip) * 9 if ip else 0.0
-    avg    = hits / ab if ab else 0.0
+    whip = (hits + bb) / ip if ip else None
+    hr_9 = (hr / ip) * 9 if ip else None
+    fip = (((13 * hr) + (3 * (bb + hbp)) - (2 * so)) / ip + _CFIP) if ip else None
 
     babip_den = ab - so - hr + sac_fly
-    babip = (hits - hr) / babip_den if babip_den > 0 else 0.0
+    babip = (hits - hr) / babip_den if babip_den > 0 else None
 
-    # wOBA via linear weights (against the pitcher)
-    woba_num = sum(_WOBA_WEIGHTS[e] * _count(events, e) for e in _WOBA_WEIGHTS)
-    woba_den = ab + bb + hbp + sac_fly
-    woba = woba_num / woba_den if woba_den else 0.0
-
-    # FIP and a FIP-shaped ERA proxy (we don't have earned runs in pitch data)
-    fip = (((13 * hr) + (3 * (bb + hbp)) - (2 * so)) / ip + _CFIP) if ip else 0.0
-    # xwOBA against — use BIP-level estimated_woba_using_speedangle if present.
-    if "estimated_woba_using_speedangle" in df.columns:
-        bip = df.dropna(subset=["launch_speed", "estimated_woba_using_speedangle"])
-        if not bip.empty:
-            x_bip = float(bip["estimated_woba_using_speedangle"].sum())
-            xwoba_num = _WOBA_WEIGHTS["walk"] * bb + _WOBA_WEIGHTS["hit_by_pitch"] * hbp + x_bip
-            xwoba = xwoba_num / woba_den if woba_den else 0.0
-        else:
-            xwoba = woba
-    else:
-        xwoba = woba
-
-    # Scale xwOBA-against to the ERA range. Statcast's published xERA uses
-    # proprietary park / league factors we don't have; empirically the
-    # league-wide xwOBA→ERA slope is ~22 ERA points per 0.010 xwOBA. Anchor
-    # the line at (league_avg_xwoba=0.310, league_avg_ERA=4.20). When xwoba
-    # is zero (no data), fall back to FIP so the metric still has a sensible
-    # value.
-    xera = (xwoba - 0.310) * 22.0 + 4.20 if xwoba > 0 else fip
-
-    # Contact quality (against)
-    batted = df.dropna(subset=["launch_speed"]) if "launch_speed" in df.columns else pd.DataFrame()
-    hardhit_pct = float((batted["launch_speed"] >= 95).mean()) if not batted.empty else None
-    barrel_pct  = _barrel_rate(batted)
-
-    # CSW%
+    # Pitch-level rates (these aren't on the season leaderboards as raw values)
     desc = df.get("description", pd.Series(dtype="object"))
     called = _count(desc, "called_strike")
     whiff  = _count(desc, "swinging_strike") + _count(desc, "swinging_strike_blocked")
-    csw    = (called + whiff) / pitches if pitches else 0.0
-    swstr  = whiff / pitches if pitches else 0.0
+    csw    = (called + whiff) / pitches if pitches else None
+    swstr  = whiff / pitches if pitches else None
 
-    # Drivers — velocity / spin / release / pitch mix / zone / first-pitch strike
-    pitch_type = df.get("pitch_type", pd.Series(dtype="object"))
-    fb_mask = pitch_type.isin(_FB_PITCH_TYPES)
-    sl_mask = pitch_type.isin(_SL_PITCH_TYPES)
-    cb_mask = pitch_type.isin(_CB_PITCH_TYPES)
-    ch_mask = pitch_type.isin(_CH_PITCH_TYPES)
-
-    def _mean(col: str, mask: pd.Series) -> float | None:
-        if col not in df.columns or not mask.any():
-            return None
-        v = df.loc[mask, col].dropna()
-        return float(v.mean()) if not v.empty else None
-
-    fbv     = _mean("release_speed",      fb_mask)
-    fbspin  = _mean("release_spin_rate",  fb_mask)
-    rel_h   = _mean("release_pos_z",      pd.Series([True] * len(df), index=df.index))
-    rel_s   = _mean("release_pos_x",      pd.Series([True] * len(df), index=df.index))
-    ext     = _mean("release_extension",  pd.Series([True] * len(df), index=df.index))
-
-    fb_use = float(fb_mask.mean()) if pitches else 0.0
-    sl_use = float(sl_mask.mean()) if pitches else 0.0
-    cb_use = float(cb_mask.mean()) if pitches else 0.0
-    ch_use = float(ch_mask.mean()) if pitches else 0.0
-
-    # Zone% — Statcast zone 1..9 is in-strike-zone, 11..14 is outside.
     zone_pct: float | None = None
     if "zone" in df.columns:
         z = pd.to_numeric(df["zone"], errors="coerce").dropna()
         if not z.empty:
             zone_pct = float(((z >= 1) & (z <= 9)).mean())
 
-    # First-pitch strike %
     f_strike_pct: float | None = None
     if "pitch_number" in df.columns and "type" in df.columns:
         first = df[df["pitch_number"] == 1]
         if not first.empty:
             f_strike_pct = float(first["type"].isin(["S", "X"]).mean())
 
-    # Chase induced (O-Swing%) — pitches outside the zone that the batter swung at.
-    o_swing_induced_pct: float | None = None
-    if "zone" in df.columns and "description" in df.columns:
-        z = pd.to_numeric(df["zone"], errors="coerce")
-        outside = df[z >= 10]
-        if not outside.empty:
-            swung = outside["description"].isin([
-                "swinging_strike", "swinging_strike_blocked", "foul", "foul_tip", "hit_into_play",
-            ])
-            o_swing_induced_pct = float(swung.mean())
+    # Release mechanics — averages across all pitches the player threw.
+    release_h = _mean_or_none(df["release_pos_z"]) if "release_pos_z" in df.columns else None
+    release_s = _mean_or_none(df["release_pos_x"]) if "release_pos_x" in df.columns else None
+    extension = _mean_or_none(df["release_extension"]) if "release_extension" in df.columns else None
 
     return {
-        # Outcomes
-        "ERA":      fip,            # FIP-shaped proxy when earned runs aren't available
-        "FIP":      fip,
-        "xERA":     xera,
-        "xFIP":     fip,            # without league HR/FB rate, fall back to FIP
-        "WHIP":     whip,
-        "K%":       k_pct,
-        "BB%":      bb_pct,
-        "K-BB%":    k_pct - bb_pct,
-        "HR/9":     hr_9,
-        "BABIP":    babip,
-        "AVG":      avg,
-        "wOBA":     woba,
-        "HardHit%": hardhit_pct,
-        "Barrel%":  barrel_pct,
-        "CSW%":     csw,
-        # Drivers
-        "FBv":              fbv,
-        "FBspin (sc)":      fbspin,
-        "Release_height":   rel_h,
-        "Release_side":     rel_s,
-        "Extension":        ext,
-        "FB%":              fb_use,
-        "SL%":              sl_use,
-        "CB%":              cb_use,
-        "CH%":              ch_use,
+        "IP":               ip,
+        "FIP":              fip,
+        "xFIP":             fip,    # without league HR/FB rate we can't separate; FIP is the honest answer
+        "WHIP":             whip,
+        "HR/9":             hr_9,
+        "BABIP":            babip,
+        "CSW%":             csw,
+        "SwStr%":           swstr,    # pitcher-side swstr; leaderboard's pitcher swing_miss_percent will override when present
         "Zone%":            zone_pct,
         "F-Strike%":        f_strike_pct,
-        "O-Swing%":         o_swing_induced_pct,
-        "SwStr%":           swstr,
-        # Sample size
-        "PA":       pa,
-        "IP":       ip,
-        "Pitches":  pitches,
+        "Release_height":   release_h,
+        "Release_side":     release_s,
+        "Extension":        extension,
+        "Pitches":          pitches,
+        "_PA_pitch":        pa,         # for sanity-checking vs leaderboard PA
     }
 
 
 # ---------------------------------------------------------------------------
-# Hitter aggregates
+# Hitter gaps
 # ---------------------------------------------------------------------------
 
-def aggregate_hitter_season(df: pd.DataFrame) -> dict[str, float | None]:
-    """Compute one season of hitter aggregates from pitch-level Statcast."""
+def hitter_gaps_from_pitches(df: pd.DataFrame) -> dict[str, float | int | None]:
+    """Compute hitter-side metrics Savant leaderboards don't publish — chiefly
+    the slash line beyond AVG/SLG (OBP/OPS/ISO) and BABIP."""
     if df.empty:
         return {}
 
     pa = _pa_total(df)
-    events = _ab_events(df)
+    events = _terminal_events(df)
 
     so   = _count(events, "strikeout") + _count(events, "strikeout_double_play")
     bb   = _count(events, "walk")
@@ -282,63 +185,36 @@ def aggregate_hitter_season(df: pd.DataFrame) -> dict[str, float | None]:
     triple = _count(events, "triple")
     hr   = _count(events, "home_run")
     hits = single + double + triple + hr
-
     sac     = _count(events, "sac_fly") + _count(events, "sac_bunt")
     sac_fly = _count(events, "sac_fly")
+
     ab = max(pa - bb - hbp - sac, 0)
     tb = single + 2 * double + 3 * triple + 4 * hr
 
-    avg = hits / ab if ab else 0.0
-    obp = (hits + bb + hbp) / pa if pa else 0.0
-    slg = tb / ab if ab else 0.0
-    ops = obp + slg
-    iso = slg - avg
-    k_pct  = so / pa if pa else 0.0
-    bb_pct = bb / pa if pa else 0.0
+    avg = hits / ab if ab else None
+    slg = tb / ab if ab else None
+    # OBP excludes sacrifice bunts from the denominator (PA includes them).
+    obp_den = ab + bb + hbp + sac_fly
+    obp = (hits + bb + hbp) / obp_den if obp_den else None
+    ops = (obp + slg) if (obp is not None and slg is not None) else None
+    iso = (slg - avg) if (slg is not None and avg is not None) else None
+
     babip_den = ab - so - hr + sac_fly
-    babip = (hits - hr) / babip_den if babip_den > 0 else 0.0
+    babip = (hits - hr) / babip_den if babip_den > 0 else None
 
-    woba_num = sum(_WOBA_WEIGHTS[e] * _count(events, e) for e in _WOBA_WEIGHTS)
-    woba_den = ab + bb + hbp + sac_fly
-    woba = woba_num / woba_den if woba_den else 0.0
-
-    # xwOBA: walks/HBP weighted same as wOBA, BIPs use estimated_woba_using_speedangle
-    if "estimated_woba_using_speedangle" in df.columns:
-        bip = df.dropna(subset=["launch_speed", "estimated_woba_using_speedangle"])
-        if not bip.empty:
-            x_bip = float(bip["estimated_woba_using_speedangle"].sum())
-            xwoba_num = _WOBA_WEIGHTS["walk"] * bb + _WOBA_WEIGHTS["hit_by_pitch"] * hbp + x_bip
-            xwoba = xwoba_num / woba_den if woba_den else 0.0
-        else:
-            xwoba = woba
-    else:
-        xwoba = woba
-
-    # wRC+ requires league wOBA + park factor — out of scope without those.
-    # We omit it (analysis layer tolerates missing columns).
-
-    # Plate discipline
+    # Plate-discipline rates derivable from pitch descriptions.
     desc = df.get("description", pd.Series(dtype="object"))
+    pitches = len(df)
     whiff = _count(desc, "swinging_strike") + _count(desc, "swinging_strike_blocked")
     foul  = _count(desc, "foul") + _count(desc, "foul_tip")
     in_play = _count(desc, "hit_into_play")
     swings = whiff + foul + in_play
-    pitches = len(df)
-    whiff_pct = whiff / swings if swings else None
     contact_pct = (swings - whiff) / swings if swings else None
     swstr_pct = whiff / pitches if pitches else None
 
-    # Chase + Z-Contact
-    o_swing_pct: float | None = None
     z_contact_pct: float | None = None
     if "zone" in df.columns:
         z = pd.to_numeric(df["zone"], errors="coerce")
-        outside = df[z >= 10]
-        if not outside.empty:
-            o_swung = outside["description"].isin([
-                "swinging_strike", "swinging_strike_blocked", "foul", "foul_tip", "hit_into_play",
-            ])
-            o_swing_pct = float(o_swung.mean())
         inside = df[(z >= 1) & (z <= 9)]
         if not inside.empty:
             iz_swings = inside["description"].isin([
@@ -351,94 +227,25 @@ def aggregate_hitter_season(df: pd.DataFrame) -> dict[str, float | None]:
             n_wh = int(iz_whiffs.sum())
             z_contact_pct = (n_sw - n_wh) / n_sw if n_sw else None
 
-    # Contact quality
-    batted = df.dropna(subset=["launch_speed"]) if "launch_speed" in df.columns else pd.DataFrame()
-    ev      = float(batted["launch_speed"].mean()) if not batted.empty else None
-    max_ev  = float(batted["launch_speed"].max())  if not batted.empty else None
-    hardhit = float((batted["launch_speed"] >= 95).mean()) if not batted.empty else None
-    barrel  = _barrel_rate(batted)
-    la      = float(batted["launch_angle"].mean()) if not batted.empty and "launch_angle" in batted.columns else None
-
-    # Batted-ball profile (bb_type categorical)
-    gb = fb = ld = None
-    if "bb_type" in batted.columns and not batted.empty:
-        share = batted["bb_type"].value_counts(normalize=True)
-        gb = float(share.get("ground_ball", 0.0))
-        fb = float(share.get("fly_ball",   0.0))
-        ld = float(share.get("line_drive", 0.0))
-
-    # Bat tracking (2024+) — bat_speed / swing_length come through when present.
-    bat_speed = (
-        float(df["bat_speed"].dropna().mean()) if "bat_speed" in df.columns and df["bat_speed"].notna().any() else None
-    )
-    swing_length = (
-        float(df["swing_length"].dropna().mean()) if "swing_length" in df.columns and df["swing_length"].notna().any() else None
-    )
-
     return {
-        "AVG":       avg,
-        "OBP":       obp,
-        "SLG":       slg,
-        "OPS":       ops,
-        "wOBA":      woba,
-        "xwOBA":     xwoba,
-        "ISO":       iso,
-        "K%":        k_pct,
-        "BB%":       bb_pct,
-        "BABIP":     babip,
-        # Drivers
-        "avg_bat_speed":      bat_speed,
-        "avg_swing_length":   swing_length,
-        "O-Swing%":           o_swing_pct,
-        "SwStr%":             swstr_pct,
-        "Contact%":           contact_pct,
-        "Z-Contact%":         z_contact_pct,
-        "Whiff%":             whiff_pct,
-        "EV":                 ev,
-        "maxEV":              max_ev,
-        "HardHit%":           hardhit,
-        "Barrel%":            barrel,
-        "LA":                 la,
-        "GB%":                gb,
-        "FB%":                fb,
-        "LD%":                ld,
-        # Sample size
-        "PA":      pa,
+        "OBP":          obp,
+        "OPS":          ops,
+        "ISO":          iso,
+        "BABIP":        babip,
+        # Slash-line basics too — leaderboard provides AVG/SLG/wOBA already,
+        # but if a player slipped under their minPA threshold, this fills in.
+        "AVG":          avg,
+        "SLG":          slg,
+        "Contact%":     contact_pct,
+        "Z-Contact%":   z_contact_pct,
+        "SwStr%":       swstr_pct,
+        "_PA_pitch":    pa,
     }
 
 
 # ---------------------------------------------------------------------------
-# Shared helpers
-# ---------------------------------------------------------------------------
-
-def _barrel_rate(batted: pd.DataFrame) -> float | None:
-    """Approximation of Statcast 'Barrel'.
-
-    Statcast's definition is a piecewise EV/LA window that expands with EV:
-      EV  98:  LA 26-30   (range 4°)
-      EV  99:  LA 25-31   (range 6°)
-      EV 100:  LA 24-33   (range 9°)
-      …
-      EV 116:  LA  8-50   (range 42°)
-    Expansion is roughly 1° on each side per +1 mph of EV. That's a close
-    enough approximation to land in the right ballpark — a single fixed
-    98-mph/26-30° window only catches the narrowest tier and misses most
-    real barrels.
-    """
-    if batted.empty or "launch_angle" not in batted.columns:
-        return None
-    ev = batted["launch_speed"]
-    la = batted["launch_angle"]
-    expand = (ev - 98).clip(lower=0)
-    la_min = 26 - expand
-    la_max = 30 + expand
-    barrel = (ev >= 98) & (la >= la_min) & (la <= la_max)
-    return float(barrel.mean())
-
-
-# ---------------------------------------------------------------------------
-# Public entry point — produces a DataFrame with the same shape the analysis
-# layer expects from FanGraphs.
+# Public entry point — preserves the old signature so aggregates.py can
+# keep calling it while we switch the data path under the hood.
 # ---------------------------------------------------------------------------
 
 def season_aggregates_from_statcast(
@@ -448,14 +255,12 @@ def season_aggregates_from_statcast(
     *,
     fetch_statcast,
 ) -> pd.DataFrame:
-    """One row per season for the given player, columns matching the FanGraphs
-    schema the analysis layer expects.
+    """One row per season with PITCH-DERIVED gap metrics only.
 
-    `fetch_statcast(mlbam_id, role, season)` is injected so the data layer
-    can control caching / retries.
+    The leaderboard-sourced metrics get merged in by `aggregates.get_season_aggregates`.
     """
     norm_role = "pitcher" if role in ("pitcher", "pitching") else "hitter"
-    aggregator = aggregate_pitcher_season if norm_role == "pitcher" else aggregate_hitter_season
+    deriver = pitcher_gaps_from_pitches if norm_role == "pitcher" else hitter_gaps_from_pitches
 
     rows: list[dict] = []
     for season in seasons:
@@ -466,12 +271,17 @@ def season_aggregates_from_statcast(
             continue
         if sc is None or sc.empty:
             continue
-        agg = aggregator(sc)
-        if not agg:
+        gaps = deriver(sc)
+        if not gaps:
             continue
-        agg["__season"] = season
-        rows.append(agg)
+        gaps["__season"] = season
+        rows.append(gaps)
 
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+__all__ = [
+    "pitcher_gaps_from_pitches",
+    "hitter_gaps_from_pitches",
+    "season_aggregates_from_statcast",
+]

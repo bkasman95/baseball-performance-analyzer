@@ -1,8 +1,24 @@
-"""Season-level FanGraphs aggregates for hitters and pitchers.
+"""Season-level aggregates for hitters and pitchers.
 
-These are the inputs to the year-over-year anomaly layer. One row per
-(player, season). pybaseball's `batting_stats` / `pitching_stats` return
-~300 columns per row; we cache the full thing per season and filter on read.
+Three layered sources, in priority order:
+
+  1. **Baseball Savant leaderboards** (primary) — MLB's official per-season
+     metrics: xERA, xBA, xSLG, xwOBA, Barrel%, HardHit%, EV, pitch arsenal,
+     swing decisions. These are computed by Savant with park / league
+     factors we can't replicate. See `savant_leaderboards.py`.
+
+  2. **Pitch-data derivations** (gap-filler) — the metrics MLB doesn't
+     publish on a leaderboard (FIP, WHIP, HR/9, BABIP, CSW%, OBP, etc.).
+     Computed from cached pitch-level Statcast, with exact formulas. See
+     `savant_aggregates.py`.
+
+  3. **FanGraphs `batting_stats` / `pitching_stats`** (fallback) — only used
+     if BOTH Savant paths fail for a given season. FanGraphs blocks many
+     cloud IP ranges so this rarely succeeds in production, but it's free
+     insurance for local development.
+
+Each season ends up as one row in the returned DataFrame, with columns that
+match what the metric catalog expects (see `app/analysis/metrics.py`).
 """
 
 from __future__ import annotations
@@ -27,7 +43,7 @@ def _normalize_role(role: Role) -> str:
 
 
 # ---------------------------------------------------------------------------
-# League-wide season pulls (cached per season)
+# FanGraphs fallback (rarely used in prod; FG blocks most cloud IPs)
 # ---------------------------------------------------------------------------
 
 @with_retry
@@ -36,7 +52,6 @@ def _fetch_batting(season: int) -> pd.DataFrame:
     from pybaseball import batting_stats
 
     try:
-        # qual=0 keeps everyone — we'll apply sample-size guardrails per-player downstream.
         df = batting_stats(season, season, qual=0)
     except Exception as e:
         raise classify_pybaseball_error(e) from e
@@ -62,26 +77,18 @@ def get_league_season(season: int, role: Role, *, force_refresh: bool = False) -
     return read_through_cache(key, lambda: fetch(season), force_refresh=force_refresh)
 
 
-# ---------------------------------------------------------------------------
-# Per-player aggregate slice
-# ---------------------------------------------------------------------------
-
-def _id_columns(df: pd.DataFrame) -> list[str]:
-    # FanGraphs returns the MLBAM id under a few possible names depending on version.
-    candidates = ["IDfg", "IDfg.1", "key_mlbam", "MLBAMID", "mlbamid", "playerid"]
-    return [c for c in candidates if c in df.columns]
-
-
 def _filter_player(df: pd.DataFrame, mlbam_id: int) -> pd.DataFrame:
-    # pybaseball joins MLBAM into the FG table when possible. Try several columns.
     for col in ("MLBAMID", "mlbamid", "key_mlbam"):
         if col in df.columns:
             sub = df[df[col].astype("Int64") == mlbam_id]
             if not sub.empty:
                 return sub
-    # Fallback: filter by name only as a last resort — caller should pass mlbam_id reliably.
     return df.iloc[0:0]
 
+
+# ---------------------------------------------------------------------------
+# Main entry point — assemble season rows from all three sources
+# ---------------------------------------------------------------------------
 
 def get_season_aggregates(
     mlbam_id: int,
@@ -92,43 +99,64 @@ def get_season_aggregates(
 ) -> pd.DataFrame:
     """Return one row per season for the given player.
 
-    Strategy:
-      1. Try the Statcast-derived path (Baseball Savant). This is the
-         primary source — pitch-level data aggregated to season totals
-         using our own formulas. Works on any host since Savant doesn't
-         block cloud IPs the way FanGraphs does.
-      2. Fall back to FanGraphs `batting_stats` / `pitching_stats` for
-         seasons that Statcast couldn't produce.
-      3. Empty DataFrame if both paths fail for every season — the
-         analysis layer detects that and notes it in the report.
+    Each row is built by layering, in this order (later layers win on key
+    collisions): pitch-derived gaps → Savant leaderboards → FanGraphs.
+    Savant leaderboards are authoritative for everything they publish.
     """
-    # Step 1: Statcast-derived (primary).
-    from app.data.savant_aggregates import season_aggregates_from_statcast
+    from app.data.savant_aggregates import pitcher_gaps_from_pitches, hitter_gaps_from_pitches
+    from app.data.savant_leaderboards import assemble_pitcher_season, assemble_hitter_season
     from app.data.statcast import get_statcast
 
-    def _statcast_fetch(pid: int, r: str, s: int) -> pd.DataFrame:
-        sc_role = "pitcher" if r in ("pitcher", "pitching") else "hitter"
-        return get_statcast(pid, sc_role, s, force_refresh=force_refresh)  # type: ignore[arg-type]
+    norm = "pitcher" if role in ("pitcher", "pitching") else "hitter"
+    assemble_leaderboard = assemble_pitcher_season if norm == "pitcher" else assemble_hitter_season
+    derive_gaps = pitcher_gaps_from_pitches if norm == "pitcher" else hitter_gaps_from_pitches
 
-    try:
-        savant_df = season_aggregates_from_statcast(
-            mlbam_id, role, list(seasons), fetch_statcast=_statcast_fetch,
-        )
-    except Exception as e:
-        log.warning("Savant-derived aggregates failed for %s: %s", mlbam_id, e)
-        savant_df = pd.DataFrame()
+    season_list = list(seasons)
+    rows: list[dict] = []
 
-    seasons_with_savant = set(savant_df["__season"].astype(int).tolist()) if not savant_df.empty else set()
+    for season in season_list:
+        # Layer 1: pitch-derived (BABIP, FIP, WHIP, OBP, etc.)
+        try:
+            sc = get_statcast(mlbam_id, norm, season, force_refresh=force_refresh)
+        except Exception as e:
+            log.warning("statcast pitch fetch failed for %s/%s/%s: %s", mlbam_id, norm, season, e)
+            sc = pd.DataFrame()
+        gaps = derive_gaps(sc) if not sc.empty else {}
 
-    # Step 2: FanGraphs fallback for seasons Statcast couldn't cover.
+        # Layer 2: Savant leaderboards (xERA, xwOBA, Barrel%, HardHit%, etc.)
+        try:
+            lb = assemble_leaderboard(mlbam_id, season, force_refresh=force_refresh)
+        except Exception as e:
+            log.warning("savant leaderboard assembly failed for %s/%s: %s", mlbam_id, season, e)
+            lb = {}
+
+        # Merge: later wins. Leaderboards override pitch-derived for any
+        # metric they both publish (the leaderboard is authoritative).
+        row: dict = {**gaps, **lb}
+
+        # K-BB% is a convenient derived metric used as an outcome.
+        k_pct = row.get("K%")
+        bb_pct = row.get("BB%")
+        if k_pct is not None and bb_pct is not None:
+            row["K-BB%"] = float(k_pct) - float(bb_pct)
+
+        if not row:
+            continue
+        row["__season"] = season
+        rows.append(row)
+
+    savant_df = pd.DataFrame(rows) if rows else pd.DataFrame()
+    seasons_covered = set(savant_df["__season"].astype(int).tolist()) if not savant_df.empty else set()
+
+    # Layer 3: FanGraphs fallback for seasons Savant couldn't cover at all.
     fg_frames: list[pd.DataFrame] = []
-    for season in seasons:
-        if season in seasons_with_savant:
+    for season in season_list:
+        if season in seasons_covered:
             continue
         try:
             league = get_league_season(season, role, force_refresh=force_refresh)
         except Exception as e:
-            log.warning("league_season fetch failed for %s/%s: %s", role, season, e)
+            log.warning("FG league_season fetch failed for %s/%s: %s", role, season, e)
             continue
         if league.empty:
             continue
@@ -141,16 +169,3 @@ def get_season_aggregates(
     if not pieces:
         return pd.DataFrame()
     return pd.concat(pieces, ignore_index=True, sort=False)
-
-
-def _seasons_player_appears_in(mlbam_id: int, seasons: Iterable[int], role: Role) -> bool:
-    for season in seasons:
-        try:
-            df = get_league_season(season, role)
-        except Exception:
-            continue
-        if df.empty:
-            continue
-        if not _filter_player(df, mlbam_id).empty:
-            return True
-    return False

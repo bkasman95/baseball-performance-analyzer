@@ -1,16 +1,16 @@
-"""Tests for the Savant-derived season aggregator.
+"""Tests for pitch-data gap derivation.
 
-Synthetic Statcast pitch data is small and easy to reason about, so we can
-verify the aggregator computes the expected outcome and driver metrics
-without ever touching the network.
+`savant_aggregates` now computes only the metrics MLB doesn't publish on a
+season leaderboard (FIP, WHIP, OBP, etc.). Synthetic Statcast pitch data is
+small and easy to reason about, so we can verify the formulas without
+touching the network.
 """
 
-import numpy as np
 import pandas as pd
 
 from app.data.savant_aggregates import (
-    aggregate_hitter_season,
-    aggregate_pitcher_season,
+    hitter_gaps_from_pitches,
+    pitcher_gaps_from_pitches,
     season_aggregates_from_statcast,
 )
 
@@ -41,8 +41,12 @@ def _pitch(events=None, description="ball", pitch_type="FF",
     }
 
 
-def test_aggregate_pitcher_basic_counts():
-    # Build 5 plate appearances ending in: K, BB, single, HR, fly_out
+# ---------------------------------------------------------------------------
+# Pitcher gaps
+# ---------------------------------------------------------------------------
+
+def test_pitcher_gaps_basic_counts():
+    """5 PAs: K, BB, single, HR, fly out. Verify IP / WHIP / FIP / BABIP."""
     rows = []
     # K (3 swinging strikes)
     for i in range(3):
@@ -58,81 +62,117 @@ def test_aggregate_pitcher_basic_counts():
             description="ball",
             at_bat_number=2, pitch_number=i + 1,
         ))
-    # Single (1 pitch, in play, EV 95 LA 10)
-    rows.append(_pitch(
-        events="single", description="hit_into_play", launch_speed=95.0,
-        launch_angle=10.0, at_bat_number=3, ptype="X",
-    ))
-    # HR (1 pitch, in play, EV 105 LA 28)
-    rows.append(_pitch(
-        events="home_run", description="hit_into_play", launch_speed=105.0,
-        launch_angle=28.0, at_bat_number=4, ptype="X",
-    ))
-    # Fly out (1 pitch, in play, EV 85 LA 35)
-    rows.append(_pitch(
-        events="field_out", description="hit_into_play", launch_speed=85.0,
-        launch_angle=35.0, at_bat_number=5, ptype="X",
-    ))
+    # Single (EV 95)
+    rows.append(_pitch(events="single", description="hit_into_play",
+                       launch_speed=95.0, launch_angle=10.0,
+                       at_bat_number=3, ptype="X"))
+    # HR (EV 105)
+    rows.append(_pitch(events="home_run", description="hit_into_play",
+                       launch_speed=105.0, launch_angle=28.0,
+                       at_bat_number=4, ptype="X"))
+    # Fly out
+    rows.append(_pitch(events="field_out", description="hit_into_play",
+                       launch_speed=85.0, launch_angle=35.0,
+                       at_bat_number=5, ptype="X"))
 
     df = pd.DataFrame(rows)
-    agg = aggregate_pitcher_season(df)
+    gaps = pitcher_gaps_from_pitches(df)
 
-    assert agg["PA"] == 5
-    assert agg["K%"] == 1 / 5
-    assert agg["BB%"] == 1 / 5
-    # WHIP: (1 hit single + 1 HR + 1 BB) / IP. Outs = K + field_out = 2 -> IP = 2/3
-    assert agg["WHIP"] > 0
-    # HardHit% — 2 of 3 batted balls had EV>=95
-    assert abs(agg["HardHit%"] - 2 / 3) < 1e-9
-    # 1 barrel (EV 105, LA 28 -> in 26-30 window)
-    assert abs(agg["Barrel%"] - 1 / 3) < 1e-9
-    # CSW% — 3 swinging strikes out of 10 pitches
-    assert abs(agg["CSW%"] - 3 / 10) < 1e-9
+    # Outs = K + field_out = 2, IP = 2/3.
+    assert abs(gaps["IP"] - 2 / 3) < 1e-9
+    # WHIP = (2 hits + 1 BB) / IP = 3 / (2/3) = 4.5
+    assert abs(gaps["WHIP"] - 4.5) < 1e-9
+    # HR/9 = (1/IP)*9 = 13.5
+    assert abs(gaps["HR/9"] - 13.5) < 1e-9
+    # AB = PA-BB-HBP-SAC = 5-1-0-0 = 4
+    # BABIP = (hits - HR) / (AB - K - HR + SF) = (2-1)/(4-1-1+0) = 1/2
+    assert abs(gaps["BABIP"] - 0.5) < 1e-9
+    # CSW%: 3 swinging strikes of 10 pitches
+    assert abs(gaps["CSW%"] - 3 / 10) < 1e-9
 
 
-def test_aggregate_hitter_basic_counts():
+def test_pitcher_gaps_counts_double_plays_as_two_outs():
+    """A GIDP must count as 2 outs, not 1 — otherwise IP is undercounted."""
+    rows = [
+        _pitch(events="grounded_into_double_play", description="hit_into_play",
+               launch_speed=85.0, launch_angle=-5.0,
+               at_bat_number=1, ptype="X"),
+        _pitch(events="strikeout", description="swinging_strike",
+               at_bat_number=2),
+    ]
+    gaps = pitcher_gaps_from_pitches(pd.DataFrame(rows))
+    # 2 outs from GIDP + 1 from K = 3 outs = 1.0 IP
+    assert abs(gaps["IP"] - 1.0) < 1e-9
+
+
+def test_pitcher_gaps_no_leaderboard_metrics_leak():
+    """The gap-derivation must NOT emit ERA, xERA, wOBA, K%, Barrel%, etc. —
+    those belong to the leaderboard layer and would override pitch-derived
+    values if leaked."""
+    rows = [
+        _pitch(events="single", description="hit_into_play",
+               launch_speed=95.0, launch_angle=15.0, at_bat_number=1, ptype="X"),
+    ]
+    gaps = pitcher_gaps_from_pitches(pd.DataFrame(rows))
+    forbidden = {"ERA", "xERA", "xBA", "xSLG", "wOBA", "xwOBA",
+                 "K%", "BB%", "AVG", "Barrel%", "HardHit%", "EV", "maxEV"}
+    assert forbidden.isdisjoint(gaps.keys()), \
+        f"Leaderboard-owned keys leaked: {forbidden & gaps.keys()}"
+
+
+# ---------------------------------------------------------------------------
+# Hitter gaps
+# ---------------------------------------------------------------------------
+
+def test_hitter_gaps_slash_line():
+    """OBP/OPS/ISO/BABIP come from the gap layer because Savant publishes
+    AVG/SLG/wOBA but not OBP."""
     rows = []
-    # K
     for i in range(3):
-        rows.append(_pitch(
-            events="strikeout" if i == 2 else None,
-            description="swinging_strike",
-            at_bat_number=1, pitch_number=i + 1,
-        ))
-    # Single
-    rows.append(_pitch(
-        events="single", description="hit_into_play", launch_speed=98.0,
-        launch_angle=15.0, at_bat_number=2, ptype="X",
-    ))
-    # HR
-    rows.append(_pitch(
-        events="home_run", description="hit_into_play", launch_speed=110.0,
-        launch_angle=28.0, at_bat_number=3, ptype="X",
-    ))
-    # Walk
+        rows.append(_pitch(events="strikeout" if i == 2 else None,
+                           description="swinging_strike",
+                           at_bat_number=1, pitch_number=i + 1))
+    rows.append(_pitch(events="single", description="hit_into_play",
+                       launch_speed=98.0, launch_angle=15.0,
+                       at_bat_number=2, ptype="X"))
+    rows.append(_pitch(events="home_run", description="hit_into_play",
+                       launch_speed=110.0, launch_angle=28.0,
+                       at_bat_number=3, ptype="X"))
     for i in range(4):
-        rows.append(_pitch(
-            events="walk" if i == 3 else None,
-            description="ball",
-            at_bat_number=4, pitch_number=i + 1,
-        ))
+        rows.append(_pitch(events="walk" if i == 3 else None,
+                           description="ball",
+                           at_bat_number=4, pitch_number=i + 1))
 
-    df = pd.DataFrame(rows)
-    agg = aggregate_hitter_season(df)
+    gaps = hitter_gaps_from_pitches(pd.DataFrame(rows))
+    # PA = 4, AB = 3, hits = 2, BB = 1, HR = 1, SF = 0
+    # OBP = (2 + 1 + 0) / (3 + 1 + 0 + 0) = 3/4 = 0.75
+    assert abs(gaps["OBP"] - 0.75) < 1e-9
+    # SLG = (1 + 4) / 3 = 5/3
+    assert abs(gaps["SLG"] - 5 / 3) < 1e-9
+    # OPS = OBP + SLG
+    assert abs(gaps["OPS"] - (0.75 + 5 / 3)) < 1e-9
+    # ISO = SLG - AVG = 5/3 - 2/3 = 1
+    assert abs(gaps["ISO"] - 1.0) < 1e-9
 
-    assert agg["PA"] == 4
-    # AB = PA - BB = 3.  AVG = 2 hits / 3 AB
-    assert abs(agg["AVG"] - 2 / 3) < 1e-9
-    # OBP = (2 hits + 1 BB) / 4 PA
-    assert abs(agg["OBP"] - 3 / 4) < 1e-9
-    # SLG = (1 + 4) / 3
-    assert abs(agg["SLG"] - 5 / 3) < 1e-9
-    assert agg["K%"] == 1 / 4
-    assert agg["BB%"] == 1 / 4
 
+def test_hitter_gaps_no_leaderboard_metrics_leak():
+    """Hitter gap layer must not emit xwOBA, Barrel%, EV, etc."""
+    rows = [
+        _pitch(events="single", description="hit_into_play",
+               launch_speed=95.0, launch_angle=15.0, at_bat_number=1, ptype="X"),
+    ]
+    gaps = hitter_gaps_from_pitches(pd.DataFrame(rows))
+    forbidden = {"xwOBA", "xBA", "xSLG", "wOBA",
+                 "K%", "BB%", "Barrel%", "HardHit%", "EV", "maxEV"}
+    assert forbidden.isdisjoint(gaps.keys()), \
+        f"Leaderboard-owned keys leaked: {forbidden & gaps.keys()}"
+
+
+# ---------------------------------------------------------------------------
+# Multi-season entry point
+# ---------------------------------------------------------------------------
 
 def test_season_aggregates_from_statcast_uses_injected_fetcher():
-    """Verify the public entry point assembles a multi-season DataFrame."""
     seasons_data = {
         2023: pd.DataFrame([_pitch(events="single", description="hit_into_play",
                                    launch_speed=95.0, launch_angle=15.0,
@@ -152,20 +192,20 @@ def test_season_aggregates_from_statcast_uses_injected_fetcher():
 
 
 def test_aggregate_handles_empty_input():
-    assert aggregate_pitcher_season(pd.DataFrame()) == {}
-    assert aggregate_hitter_season(pd.DataFrame()) == {}
+    assert pitcher_gaps_from_pitches(pd.DataFrame()) == {}
+    assert hitter_gaps_from_pitches(pd.DataFrame()) == {}
 
 
 def test_aggregate_handles_missing_optional_columns():
-    """Statcast schema sometimes omits zone / bb_type / bat_speed for older
-    seasons. The aggregator must not crash; missing metrics come back as None."""
+    """Statcast omits zone / bb_type for older seasons. The gap deriver
+    must not crash; metrics it can't compute come back as None."""
     minimal = pd.DataFrame([
         {"events": "single", "description": "hit_into_play",
          "at_bat_number": 1, "game_pk": 1, "pitch_number": 1, "type": "X",
-         "pitch_type": "FF", "release_speed": 95.0,
-         "launch_speed": 95.0},
+         "pitch_type": "FF", "release_speed": 95.0, "launch_speed": 95.0},
     ])
-    agg = aggregate_hitter_season(minimal)
-    assert agg["PA"] == 1
-    assert agg["GB%"] is None       # no bb_type column
-    assert agg["O-Swing%"] is None  # no zone column
+    gaps = hitter_gaps_from_pitches(minimal)
+    # AVG / SLG / OBP work from events even without zone
+    assert gaps["AVG"] == 1.0
+    # Z-Contact% needs the `zone` column
+    assert gaps["Z-Contact%"] is None
