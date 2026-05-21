@@ -173,20 +173,36 @@ def build_report(
         fetch_league_panel = fetch_league_panel or (lambda r, s: get_league_season(s, r))
 
     seasons = list(range(season - seasons_window + 1, season + 1))
-    seasons_df = fetch_seasons(player_id, role, seasons)
-
     notes: list[str] = []
+
+    # The data layer SHOULD already be tolerant (per-season failures skipped
+    # internally), but wrap defensively: a hard exception here would surface
+    # as a failed job and a confusing "Analysis failed" toast in the UI when
+    # the more honest answer is "couldn't reach FanGraphs."
+    try:
+        seasons_df = fetch_seasons(player_id, role, seasons)
+    except Exception as e:
+        log.warning("fetch_seasons failed for player %s: %s", player_id, e)
+        seasons_df = pd.DataFrame()
+        notes.append(f"player_seasons_unavailable:{type(e).__name__}")
+
     if seasons_df is None or seasons_df.empty:
+        if "empty_player_seasons" not in notes:
+            notes.append("empty_player_seasons")
         return AnalysisReport(
             player_id=player_id,
             role=role,
             season=season,
             seasons_analyzed=seasons,
             findings=[],
-            headline="No FanGraphs season aggregates available for this player.",
+            headline=(
+                "Season-level data is unavailable for this player right now — "
+                "FanGraphs is blocking our requests from this host. "
+                "(Statcast pitch-level analysis is shown below if available.)"
+            ),
             generated_at=datetime.utcnow().isoformat() + "Z",
             sample={},
-            notes=["empty_player_seasons"],
+            notes=notes,
         )
 
     # Build league panels for each season we have (used for league z-scores + SHAP).

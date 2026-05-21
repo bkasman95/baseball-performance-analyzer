@@ -90,10 +90,20 @@ def get_season_aggregates(
     *,
     force_refresh: bool = False,
 ) -> pd.DataFrame:
-    """Return one row per season for the given player, FanGraphs columns intact."""
+    """Return one row per season for the given player, FanGraphs columns intact.
+
+    Tolerant per-season: if a season's league panel can't be fetched (block,
+    network, 404), that season is skipped and a warning logged. Returns an
+    empty DataFrame if EVERY season fails — the analysis layer detects that
+    and reports it in the analysis report's notes.
+    """
     frames: list[pd.DataFrame] = []
     for season in seasons:
-        league = get_league_season(season, role, force_refresh=force_refresh)
+        try:
+            league = get_league_season(season, role, force_refresh=force_refresh)
+        except Exception as e:
+            log.warning("league_season fetch failed for %s/%s: %s", role, season, e)
+            continue
         if league.empty:
             continue
         sub = _filter_player(league, mlbam_id).copy()
