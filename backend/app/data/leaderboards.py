@@ -1,9 +1,9 @@
 """League-wide leaderboards and percentiles for context/baselines.
 
-Used by the analysis layer to z-score a player against the league for the
-same season, to surface league-relative percentiles in the UI, and (via
-`savant_leaderboards.assemble_*`) to source MLB's official per-player
-season aggregates.
+Every Savant leaderboard goes through the direct CSV fetcher in `savant.py`
+— pybaseball's wrappers force a UTF-8 decode that crashes on Savant's
+latin-1 player names, and we don't want our retry layer eating ~16s per
+endpoint backing off from a failure that's actually permanent.
 """
 
 from __future__ import annotations
@@ -14,8 +14,6 @@ from typing import Literal
 import pandas as pd
 
 from app.data.cache import read_through_cache
-from app.data.pybaseball_setup import setup_pybaseball
-from app.data.retry import with_retry, classify_pybaseball_error
 from app.data.savant import fetch_savant_leaderboard, SavantBoard
 
 
@@ -28,49 +26,29 @@ LeaderboardKind = Literal[
     "batter_exitvelo",
     "pitcher_percentile",
     "batter_percentile",
-    "pitcher_arsenal",            # statcast_pitcher_arsenal_stats (per-pitch outcomes)
-    "pitcher_arsenal_usage",      # pitch-mix percentages
-    "pitcher_arsenal_speed",      # per-pitch avg velocity
-    "pitcher_arsenal_spin",       # per-pitch avg spin
-    "bat_tracking",               # Savant direct
-    "arm_angles",                 # Savant direct
+    "pitcher_arsenal_usage",
+    "pitcher_arsenal_speed",
+    "pitcher_arsenal_spin",
+    "pitcher_arsenal_stats",
+    "bat_tracking",
+    "arm_angles",
 ]
 
 
-@with_retry
-def _fetch_pybaseball_board(kind: LeaderboardKind, season: int) -> pd.DataFrame:
-    setup_pybaseball()
-    import pybaseball as pb
-
-    try:
-        if kind == "pitcher_expected":
-            return pb.statcast_pitcher_expected_stats(year=season, minPA=10)
-        if kind == "batter_expected":
-            return pb.statcast_batter_expected_stats(year=season, minPA=10)
-        if kind == "pitcher_exitvelo":
-            return pb.statcast_pitcher_exitvelo_barrels(year=season, minBBE=10)
-        if kind == "batter_exitvelo":
-            return pb.statcast_batter_exitvelo_barrels(year=season, minBBE=10)
-        if kind == "pitcher_percentile":
-            return pb.statcast_pitcher_percentile_ranks(year=season)
-        if kind == "batter_percentile":
-            return pb.statcast_batter_percentile_ranks(year=season)
-        if kind == "pitcher_arsenal":
-            return pb.statcast_pitcher_arsenal_stats(year=season)
-        if kind == "pitcher_arsenal_usage":
-            return pb.statcast_pitcher_pitch_arsenal(year=season, minP=50, arsenal_type="n_")
-        if kind == "pitcher_arsenal_speed":
-            return pb.statcast_pitcher_pitch_arsenal(year=season, minP=50, arsenal_type="avg_speed")
-        if kind == "pitcher_arsenal_spin":
-            return pb.statcast_pitcher_pitch_arsenal(year=season, minP=50, arsenal_type="avg_spin")
-    except Exception as e:
-        raise classify_pybaseball_error(e) from e
-    return pd.DataFrame()
-
-
-_SAVANT_KIND_TO_BOARD: dict[str, SavantBoard] = {
-    "bat_tracking": "bat-tracking",
-    "arm_angles": "arm-angles",
+# Map our analysis-layer LeaderboardKind to the Savant URL key.
+_KIND_TO_BOARD: dict[LeaderboardKind, SavantBoard] = {
+    "pitcher_expected":        "pitcher-expected",
+    "batter_expected":         "batter-expected",
+    "pitcher_exitvelo":        "pitcher-exitvelo",
+    "batter_exitvelo":         "batter-exitvelo",
+    "pitcher_percentile":      "pitcher-percentile",
+    "batter_percentile":       "batter-percentile",
+    "pitcher_arsenal_usage":   "pitcher-arsenal-usage",
+    "pitcher_arsenal_speed":   "pitcher-arsenal-speed",
+    "pitcher_arsenal_spin":    "pitcher-arsenal-spin",
+    "pitcher_arsenal_stats":   "pitcher-arsenal-stats",
+    "bat_tracking":            "bat-tracking",
+    "arm_angles":              "arm-angles",
 }
 
 
@@ -84,21 +62,18 @@ def get_leaderboard(
 
     The full league table (~600 players) is cached as a Parquet file under
     `leaderboard:<kind>:<season>`; per-player slicing happens at read time.
-    Failure to fetch (network/upstream) returns an empty DataFrame rather
-    than raising, so the analysis layer can degrade gracefully.
+    Returns an empty DataFrame on any fetch / parse failure rather than
+    raising, so the analysis layer degrades gracefully.
     """
+    board = _KIND_TO_BOARD.get(kind)
+    if board is None:
+        log.warning("unknown leaderboard kind: %s", kind)
+        return pd.DataFrame()
     key = f"leaderboard:{kind}:{season}"
     try:
-        if kind in _SAVANT_KIND_TO_BOARD:
-            board = _SAVANT_KIND_TO_BOARD[kind]
-            return read_through_cache(
-                key,
-                lambda: fetch_savant_leaderboard(board, season),
-                force_refresh=force_refresh,
-            )
         return read_through_cache(
             key,
-            lambda: _fetch_pybaseball_board(kind, season),
+            lambda: fetch_savant_leaderboard(board, season),
             force_refresh=force_refresh,
         )
     except Exception as e:

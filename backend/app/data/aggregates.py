@@ -24,6 +24,7 @@ match what the metric catalog expects (see `app/analysis/metrics.py`).
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Iterable, Literal
 
 import pandas as pd
@@ -34,6 +35,12 @@ from app.data.retry import with_retry, classify_pybaseball_error
 
 
 log = logging.getLogger(__name__)
+
+
+# Each season's row build does 1 pitch-data fetch + parallel leaderboard
+# fetches. Running multiple seasons concurrently lets us collapse a 6-season
+# analysis from sum-of-latencies down to roughly max-of-latencies.
+_SEASON_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="season-fan")
 
 Role = Literal["hitter", "pitcher", "batting", "pitching"]
 
@@ -112,9 +119,8 @@ def get_season_aggregates(
     derive_gaps = pitcher_gaps_from_pitches if norm == "pitcher" else hitter_gaps_from_pitches
 
     season_list = list(seasons)
-    rows: list[dict] = []
 
-    for season in season_list:
+    def _build_row(season: int) -> dict | None:
         # Layer 1: pitch-derived (BABIP, FIP, WHIP, OBP, etc.)
         try:
             sc = get_statcast(mlbam_id, norm, season, force_refresh=force_refresh)
@@ -123,7 +129,9 @@ def get_season_aggregates(
             sc = pd.DataFrame()
         gaps = derive_gaps(sc) if not sc.empty else {}
 
-        # Layer 2: Savant leaderboards (xERA, xwOBA, Barrel%, HardHit%, etc.)
+        # Layer 2: Savant leaderboards (xERA, xwOBA, Barrel%, HardHit%, …).
+        # `assemble_leaderboard` fetches its 6 (pitcher) / 3 (hitter)
+        # endpoints concurrently via its own pool.
         try:
             lb = assemble_leaderboard(mlbam_id, season, force_refresh=force_refresh)
         except Exception as e:
@@ -133,17 +141,21 @@ def get_season_aggregates(
         # Merge: later wins. Leaderboards override pitch-derived for any
         # metric they both publish (the leaderboard is authoritative).
         row: dict = {**gaps, **lb}
-
-        # K-BB% is a convenient derived metric used as an outcome.
         k_pct = row.get("K%")
         bb_pct = row.get("BB%")
         if k_pct is not None and bb_pct is not None:
             row["K-BB%"] = float(k_pct) - float(bb_pct)
 
         if not row:
-            continue
+            return None
         row["__season"] = season
-        rows.append(row)
+        return row
+
+    # Fan seasons out across the pool — wall time becomes ~max(season) rather
+    # than sum(season). Within each season the leaderboards already run in
+    # parallel, so we stay polite to Savant by capping the pool small.
+    futures = [_SEASON_POOL.submit(_build_row, s) for s in season_list]
+    rows = [r for f in futures if (r := f.result()) is not None]
 
     savant_df = pd.DataFrame(rows) if rows else pd.DataFrame()
     seasons_covered = set(savant_df["__season"].astype(int).tolist()) if not savant_df.empty else set()

@@ -13,6 +13,7 @@ separately by `savant_aggregates.py` from cached pitch data.
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pandas as pd
@@ -21,6 +22,28 @@ from app.data.leaderboards import get_leaderboard
 
 
 log = logging.getLogger(__name__)
+
+
+# A small pool: each Savant CSV is ~50-200 KB; concurrency higher than ~6
+# doesn't help wall-time and risks Savant rate-limiting us.
+_LB_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="lb-fetch")
+
+
+def _fetch_many(kinds: list[str], year: int, force_refresh: bool) -> dict[str, pd.DataFrame]:
+    """Pull multiple leaderboards for a season in parallel. Each call still
+    goes through `get_leaderboard` so the cache layer is unchanged."""
+    futures = {
+        kind: _LB_POOL.submit(get_leaderboard, kind, year, force_refresh=force_refresh)  # type: ignore[arg-type]
+        for kind in kinds
+    }
+    out: dict[str, pd.DataFrame] = {}
+    for kind, fut in futures.items():
+        try:
+            out[kind] = fut.result()
+        except Exception as e:
+            log.warning("parallel leaderboard fetch failed for %s/%s: %s", kind, year, e)
+            out[kind] = pd.DataFrame()
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -80,16 +103,27 @@ def _to_pct(v: Any) -> float | None:
 # Pitcher assembly
 # ---------------------------------------------------------------------------
 
+_PITCHER_LEADERBOARD_KINDS = [
+    "pitcher_expected",
+    "pitcher_exitvelo",
+    "pitcher_percentile",
+    "pitcher_arsenal_usage",
+    "pitcher_arsenal_speed",
+    "pitcher_arsenal_spin",
+]
+
+
 def assemble_pitcher_season(mlbam_id: int, year: int, *, force_refresh: bool = False) -> dict[str, Any]:
-    """Pull every relevant Savant leaderboard for the season and return one
-    flat dict for the player. Missing values are simply absent so downstream
-    pitch-derived gap filling has somewhere to land."""
-    exp = _row_for_player(get_leaderboard("pitcher_expected", year, force_refresh=force_refresh), mlbam_id)
-    ev  = _row_for_player(get_leaderboard("pitcher_exitvelo", year, force_refresh=force_refresh), mlbam_id)
-    pct = _row_for_player(get_leaderboard("pitcher_percentile", year, force_refresh=force_refresh), mlbam_id)
-    use = _row_for_player(get_leaderboard("pitcher_arsenal_usage", year, force_refresh=force_refresh), mlbam_id)
-    spd = _row_for_player(get_leaderboard("pitcher_arsenal_speed", year, force_refresh=force_refresh), mlbam_id)
-    spn = _row_for_player(get_leaderboard("pitcher_arsenal_spin", year, force_refresh=force_refresh), mlbam_id)
+    """Pull every relevant Savant leaderboard for the season in parallel and
+    return one flat dict for the player. Missing values are simply absent so
+    downstream pitch-derived gap filling has somewhere to land."""
+    lbs = _fetch_many(_PITCHER_LEADERBOARD_KINDS, year, force_refresh)
+    exp = _row_for_player(lbs["pitcher_expected"], mlbam_id)
+    ev  = _row_for_player(lbs["pitcher_exitvelo"], mlbam_id)
+    pct = _row_for_player(lbs["pitcher_percentile"], mlbam_id)
+    use = _row_for_player(lbs["pitcher_arsenal_usage"], mlbam_id)
+    spd = _row_for_player(lbs["pitcher_arsenal_speed"], mlbam_id)
+    spn = _row_for_player(lbs["pitcher_arsenal_spin"], mlbam_id)
     merged: dict[str, Any] = {**exp, **ev, **pct, **use, **spd, **spn}
     if not merged:
         return {}
@@ -136,10 +170,18 @@ def assemble_pitcher_season(mlbam_id: int, year: int, *, force_refresh: bool = F
 # Hitter assembly
 # ---------------------------------------------------------------------------
 
+_HITTER_LEADERBOARD_KINDS = [
+    "batter_expected",
+    "batter_exitvelo",
+    "batter_percentile",
+]
+
+
 def assemble_hitter_season(mlbam_id: int, year: int, *, force_refresh: bool = False) -> dict[str, Any]:
-    exp = _row_for_player(get_leaderboard("batter_expected", year, force_refresh=force_refresh), mlbam_id)
-    ev  = _row_for_player(get_leaderboard("batter_exitvelo", year, force_refresh=force_refresh), mlbam_id)
-    pct = _row_for_player(get_leaderboard("batter_percentile", year, force_refresh=force_refresh), mlbam_id)
+    lbs = _fetch_many(_HITTER_LEADERBOARD_KINDS, year, force_refresh)
+    exp = _row_for_player(lbs["batter_expected"], mlbam_id)
+    ev  = _row_for_player(lbs["batter_exitvelo"], mlbam_id)
+    pct = _row_for_player(lbs["batter_percentile"], mlbam_id)
     merged: dict[str, Any] = {**exp, **ev, **pct}
     if not merged:
         return {}
