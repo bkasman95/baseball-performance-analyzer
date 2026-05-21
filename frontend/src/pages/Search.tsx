@@ -1,17 +1,21 @@
+import SearchBar from "../components/SearchBar";
+
 export default function Search() {
   return (
-    <section className="text-center py-16">
-      <h1 className="text-3xl font-semibold mb-3">Find a player</h1>
-      <p className="text-gray-600 mb-8">
-        Search-as-you-type and full anomaly analysis arrive in Phase 3/4. Phase 0+1
-        scaffolding is in place: the API, DB, and Parquet cache are wired.
+    <section className="py-12 text-center">
+      <h1 className="text-4xl font-semibold mb-3 text-gray-900">
+        Find a player
+      </h1>
+      <p className="text-gray-600 mb-8 max-w-xl mx-auto">
+        Type a name. DiamondScope will pull their FanGraphs / Statcast data, flag
+        meaningful spikes or dips year over year and within the season, and rank
+        the most likely drivers behind each change.
       </p>
-      <input
-        type="text"
-        disabled
-        placeholder="Player search (coming in Phase 4)"
-        className="px-4 py-3 border border-gray-300 rounded-lg w-96 max-w-full bg-white disabled:bg-gray-50 disabled:text-gray-400"
-      />
+      <SearchBar autoFocus />
+      <p className="mt-8 text-xs text-gray-400">
+        Findings are <strong>probable causes</strong>, not proven causation —
+        correlational analysis guided by domain knowledge.
+      </p>
     </section>
   );
 }

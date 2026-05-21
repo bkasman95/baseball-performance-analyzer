@@ -53,3 +53,5 @@ backend/build/
 *.sqlite
 *.sqlite3
 *.db
+tsconfig.tsbuildinfo
+frontend/tsconfig.tsbuildinfo
