@@ -15,15 +15,32 @@ log = logging.getLogger("diamondscope")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    settings = get_settings()
     log.info("Starting DiamondScope API")
     try:
         init_db()
         log.info("DB schema ready")
     except Exception as e:
-        # Don't crash the API on DB issues at startup — surface via /health instead.
         log.exception("DB init failed: %s", e)
+
+    try:
+        from app.auth.bootstrap import seed_admin_if_empty
+        seed_admin_if_empty()
+    except Exception as e:
+        log.exception("admin seed failed: %s", e)
+
+    try:
+        from app.jobs.scheduler import start_scheduler
+        start_scheduler()
+    except Exception as e:
+        log.exception("scheduler start failed: %s", e)
+
     yield
+
+    try:
+        from app.jobs.scheduler import stop_scheduler
+        stop_scheduler()
+    except Exception:
+        pass
     log.info("Shutting down DiamondScope API")
 
 
@@ -38,13 +55,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 app.include_router(api_router)
 
 
 @app.get("/api/health")
 def health():
-    """Liveness/readiness probe. Reports DB connectivity."""
+    """Liveness/readiness probe. Reports DB connectivity. Open (no auth)."""
     from sqlalchemy import text
     from app.db import engine
 

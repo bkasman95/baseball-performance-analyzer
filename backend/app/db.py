@@ -23,6 +23,6 @@ def get_db() -> Session:
 
 def init_db() -> None:
     # Imported for side effects so SQLAlchemy sees the models before create_all.
-    from app.models import user, cache_entry  # noqa: F401
+    from app.models import user, cache_entry, saved_analysis  # noqa: F401
 
     Base.metadata.create_all(bind=engine)

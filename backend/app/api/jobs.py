@@ -1,10 +1,11 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 from app.api.schemas import JobView
+from app.auth.dependencies import get_current_user
 from app.jobs.registry import get_registry
 
 
-router = APIRouter(prefix="/jobs", tags=["jobs"])
+router = APIRouter(prefix="/jobs", tags=["jobs"], dependencies=[Depends(get_current_user)])
 
 
 @router.get("/{job_id}", response_model=JobView)

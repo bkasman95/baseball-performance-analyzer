@@ -19,7 +19,7 @@ from app.jobs.registry import reset_registry_for_tests
 
 
 @pytest.fixture
-def client(monkeypatch):
+def client(monkeypatch, auth_header):
     # ----- player module stubs --------------------------------------------------
     fake_players = [
         Player(605141, 13510, "Mookie", "Betts", "hitter", 2014, 2025),
@@ -88,7 +88,9 @@ def client(monkeypatch):
 
     reset_registry_for_tests()
     from app.main import app
-    return TestClient(app)
+    tc = TestClient(app)
+    tc.headers.update(auth_header)
+    return tc
 
 
 # ---------------------------------------------------------------------------

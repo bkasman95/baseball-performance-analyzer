@@ -1,34 +1,71 @@
-"""Tests for /api/jobs, /api/auth, /api/analyses."""
+"""Tests for /api/jobs, /api/auth, /api/analyses (open + protected behavior)."""
 
 from fastapi.testclient import TestClient
 
-from app.main import app
+
+def _client():
+    from app.main import app
+    return TestClient(app)
 
 
-client = TestClient(app)
+# ---- Open endpoints --------------------------------------------------------
+
+def test_health_is_open():
+    r = _client().get("/api/health")
+    assert r.status_code == 200
 
 
-def test_jobs_endpoint_404_for_unknown():
-    r = client.get("/api/jobs/does-not-exist")
+def test_root_is_open():
+    r = _client().get("/")
+    assert r.status_code == 200
+
+
+# ---- Auth requirement on protected routes ----------------------------------
+
+def test_jobs_endpoint_requires_auth():
+    r = _client().get("/api/jobs/anything")
+    assert r.status_code == 401
+
+
+def test_players_search_requires_auth():
+    r = _client().get("/api/players/search", params={"q": "ohtani"})
+    assert r.status_code == 401
+
+
+def test_analyses_list_requires_auth():
+    r = _client().get("/api/analyses")
+    assert r.status_code == 401
+
+
+def test_logout_requires_auth():
+    r = _client().post("/api/auth/logout")
+    assert r.status_code == 401
+
+
+def test_me_requires_auth():
+    r = _client().get("/api/auth/me")
+    assert r.status_code == 401
+
+
+# ---- With auth -------------------------------------------------------------
+
+def test_jobs_endpoint_404_for_unknown(auth_header):
+    c = _client()
+    r = c.get("/api/jobs/does-not-exist", headers=auth_header)
     assert r.status_code == 404
 
 
-def test_auth_endpoints_stub_503():
-    r = client.post("/api/auth/login")
-    assert r.status_code == 503
-    r = client.post("/api/auth/logout")
-    assert r.status_code == 503
+def test_me_returns_current_user(auth_header, test_user):
+    c = _client()
+    r = c.get("/api/auth/me", headers=auth_header)
+    assert r.status_code == 200
+    assert r.json()["email"] == test_user.email
 
 
-def test_saved_analyses_endpoints_stub_503():
-    r = client.get("/api/analyses")
-    assert r.status_code == 503
-    r = client.post("/api/analyses/save")
-    assert r.status_code == 503
+# ---- OpenAPI ---------------------------------------------------------------
 
-
-def test_openapi_lists_phase3_routes():
-    r = client.get("/openapi.json")
+def test_openapi_lists_expected_routes():
+    r = _client().get("/openapi.json")
     assert r.status_code == 200
     paths = r.json()["paths"]
     expected = {
@@ -41,8 +78,10 @@ def test_openapi_lists_phase3_routes():
         "/api/health",
         "/api/auth/login",
         "/api/auth/logout",
+        "/api/auth/me",
         "/api/analyses",
         "/api/analyses/save",
+        "/api/analyses/{saved_id}",
     }
     missing = expected - set(paths.keys())
     assert not missing, f"OpenAPI is missing routes: {missing}"

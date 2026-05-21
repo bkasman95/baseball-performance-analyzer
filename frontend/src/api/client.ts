@@ -9,6 +9,38 @@ export const api = axios.create({
   validateStatus: (s) => s >= 200 && s < 400,
 });
 
+// Attach bearer token to every request when present.
+api.interceptors.request.use((config) => {
+  try {
+    const token = localStorage.getItem("ds_token");
+    if (token) {
+      config.headers = config.headers ?? {};
+      (config.headers as Record<string, string>)["Authorization"] = `Bearer ${token}`;
+    }
+  } catch {
+    // localStorage unavailable; proceed unauthenticated.
+  }
+  return config;
+});
+
+// On 401, clear stored auth so the next render sends the user to /login.
+// We don't navigate here — let the AuthContext / ProtectedRoute handle that.
+api.interceptors.response.use(
+  (r) => r,
+  (error: AxiosError) => {
+    if (error.response?.status === 401) {
+      try {
+        localStorage.removeItem("ds_token");
+        localStorage.removeItem("ds_user");
+        window.dispatchEvent(new CustomEvent("ds:unauthorized"));
+      } catch {
+        // ignore
+      }
+    }
+    return Promise.reject(error);
+  }
+);
+
 // ---------------------------------------------------------------------------
 // Shared types — mirror backend/app/api/schemas.py
 // ---------------------------------------------------------------------------

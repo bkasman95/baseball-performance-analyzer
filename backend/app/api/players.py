@@ -14,10 +14,11 @@ from datetime import datetime
 from typing import Literal
 
 import pandas as pd
-from fastapi import APIRouter, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
 from app.analysis import build_report
 from app.analysis.metrics import get_metric
+from app.auth.dependencies import get_current_user
 from app.api.schemas import (
     AnalysisAccepted,
     PlayerCard,
@@ -41,7 +42,7 @@ from app.jobs.registry import get_registry
 
 log = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/players", tags=["players"])
+router = APIRouter(prefix="/players", tags=["players"], dependencies=[Depends(get_current_user)])
 
 
 # ---------------------------------------------------------------------------
