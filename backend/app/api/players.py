@@ -90,7 +90,9 @@ _PHOTO_URL_TEMPLATE = (
 
 @router.get("/{mlbam_id}/profile", response_model=PlayerProfile)
 def profile(mlbam_id: int) -> PlayerProfile:
-    p = get_player_by_mlbam(mlbam_id)
+    # Skip role detection here — that fetches multi-season FanGraphs panels
+    # and is slow on a cold cache. The analysis job resolves the role.
+    p = get_player_by_mlbam(mlbam_id, with_role_detection=False)
     if p is None:
         raise HTTPException(status_code=404, detail=f"player not found: {mlbam_id}")
 
@@ -118,8 +120,8 @@ def profile(mlbam_id: int) -> PlayerProfile:
 # Analysis (async)
 # ---------------------------------------------------------------------------
 
-def _analysis_key(mlbam_id: int, role: str, season: int) -> str:
-    return f"analysis:{role}:{mlbam_id}:{season}"
+def _analysis_key(mlbam_id: int, season: int) -> str:
+    return f"analysis:{mlbam_id}:{season}"
 
 
 def _run_analysis(mlbam_id: int, role: str, season: int, seasons_window: int) -> dict:
@@ -135,6 +137,21 @@ def _run_analysis(mlbam_id: int, role: str, season: int, seasons_window: int) ->
         seasons_window=seasons_window,
     )
     return report.to_dict()
+
+
+def _run_analysis_with_role_detection(mlbam_id: int, season: int, seasons_window: int) -> dict:
+    """Detect role THEN run the analysis, all inside the background job.
+
+    Keeps the HTTP request that initiated this job non-blocking even on a
+    cold cache where role detection has to fetch FanGraphs panels.
+    """
+    p = get_player_by_mlbam(mlbam_id, with_role_detection=True)
+    role = "hitter"
+    if p is not None and p.role in ("pitcher", "hitter"):
+        role = p.role
+    # two_way / unknown still default to hitter; the report degrades gracefully
+    # when batting/pitching aggregates are missing.
+    return _run_analysis(mlbam_id, role, season, seasons_window)
 
 
 @router.get("/{mlbam_id}/analysis")
@@ -155,22 +172,19 @@ def get_analysis(
         that one — the client never starts duplicates.
     """
     settings = get_settings()
-    p = get_player_by_mlbam(mlbam_id)
+    # Fast lookup — role detection happens inside the background job so this
+    # HTTP request never blocks on FanGraphs network calls.
+    p = get_player_by_mlbam(mlbam_id, with_role_detection=False)
     if p is None:
         raise HTTPException(status_code=404, detail=f"player not found: {mlbam_id}")
-
-    role = p.role
-    if role not in ("pitcher", "hitter"):
-        # Default two_way / unknown to hitter; the report will still surface
-        # whatever data exists. (Two-way players need their own treatment
-        # eventually — that's a Phase 6 polish item.)
-        role = "hitter"
 
     if season is None:
         season = p.last_year or datetime.utcnow().year
 
     sw = seasons_window or settings.default_season_window
-    key = _analysis_key(mlbam_id, role, season)
+    # Key does NOT include role: role is determined inside the job, but the
+    # (player, season) pair is what makes work duplicative across requests.
+    key = _analysis_key(mlbam_id, season)
     registry = get_registry()
 
     existing = registry.get_by_key(key)
@@ -180,8 +194,8 @@ def get_analysis(
     job = registry.submit(
         key=key,
         kind="analysis",
-        fn=lambda: _run_analysis(mlbam_id, role, season, sw),
-        meta={"player_id": mlbam_id, "role": role, "season": season, "seasons_window": sw},
+        fn=lambda: _run_analysis_with_role_detection(mlbam_id, season, sw),
+        meta={"player_id": mlbam_id, "season": season, "seasons_window": sw},
     )
 
     response.status_code = 202
@@ -206,7 +220,7 @@ def metric_timeseries(
     window: int = Query(30, ge=5, le=200, description="Rolling window size when grain=rolling"),
     seasons_window: int = Query(6, ge=2, le=15),
 ) -> TimeseriesResponse:
-    p = get_player_by_mlbam(mlbam_id)
+    p = get_player_by_mlbam(mlbam_id, with_role_detection=False)
     if p is None:
         raise HTTPException(status_code=404, detail=f"player not found: {mlbam_id}")
     role = p.role if p.role in ("pitcher", "hitter") else "hitter"
@@ -303,7 +317,7 @@ def refresh(
     mlbam_id: int,
     season: int | None = Query(None, description="If given, only invalidate this season"),
 ) -> RefreshResponse:
-    p = get_player_by_mlbam(mlbam_id)
+    p = get_player_by_mlbam(mlbam_id, with_role_detection=False)
     if p is None:
         raise HTTPException(status_code=404, detail=f"player not found: {mlbam_id}")
     role = p.role if p.role in ("pitcher", "hitter") else "hitter"
@@ -318,13 +332,13 @@ def refresh(
     job_id = None
     if season is not None:
         registry = get_registry()
-        key = _analysis_key(mlbam_id, role, season)
+        key = _analysis_key(mlbam_id, season)
         sw = get_settings().default_season_window
         job = registry.submit(
             key=key,
             kind="analysis",
-            fn=lambda: _run_analysis(mlbam_id, role, season, sw),  # type: ignore[arg-type]
-            meta={"player_id": mlbam_id, "role": role, "season": season, "trigger": "refresh"},
+            fn=lambda: _run_analysis_with_role_detection(mlbam_id, season, sw),
+            meta={"player_id": mlbam_id, "season": season, "trigger": "refresh"},
         )
         job_id = job.id
 

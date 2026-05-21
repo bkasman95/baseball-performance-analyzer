@@ -33,7 +33,10 @@ def client(monkeypatch, auth_header):
         return [p for p in fake_players if ql in p.full_name.lower()][:limit]
 
     monkeypatch.setattr("app.api.players.search_players", _search)
-    monkeypatch.setattr("app.api.players.get_player_by_mlbam", lambda mid: by_id.get(mid))
+    monkeypatch.setattr(
+        "app.api.players.get_player_by_mlbam",
+        lambda mid, **_kw: by_id.get(mid),
+    )
 
     # ----- aggregates / statcast stubs -----------------------------------------
     def _season_df(_pid, _role, seasons):

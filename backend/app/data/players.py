@@ -157,7 +157,15 @@ def resolve_player(name: str) -> list[Player]:
     return [_attach_role(p) for p in candidates]
 
 
-def get_player_by_mlbam(mlbam_id: int) -> Player | None:
+def get_player_by_mlbam(mlbam_id: int, *, with_role_detection: bool = True) -> Player | None:
+    """Look up a player by MLBAM id.
+
+    Role detection fetches FanGraphs batting + pitching aggregates for up to
+    3 seasons and is slow on a cold cache (can be 30-120 s of network).
+    Endpoints that must stay fast (e.g. /profile) should pass
+    `with_role_detection=False` and let the caller resolve the role later
+    in a background job.
+    """
     df = get_name_table()
     row = df[df["key_mlbam"] == mlbam_id]
     if row.empty:
@@ -172,7 +180,9 @@ def get_player_by_mlbam(mlbam_id: int) -> Player | None:
         debut_year=int(r["mlb_played_first"]) if pd.notna(r["mlb_played_first"]) else None,
         last_year=int(r["mlb_played_last"]) if pd.notna(r["mlb_played_last"]) else None,
     )
-    return _attach_role(p)
+    if with_role_detection:
+        return _attach_role(p)
+    return p
 
 
 # ---------------------------------------------------------------------------
