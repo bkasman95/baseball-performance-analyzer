@@ -44,13 +44,31 @@ export default function AnomalyCard({ finding }: Props) {
             <ConfidenceBadge confidence={finding.confidence} />
           </div>
 
+          {finding.period && (
+            <div className="mt-1 text-xs text-gray-500">
+              <span className="font-medium text-gray-600">Time frame:</span>{" "}
+              {finding.period}
+            </div>
+          )}
+
           <p className="mt-2 text-sm text-gray-700">{finding.summary}</p>
         </div>
 
         <div className="text-right text-sm shrink-0">
           <div className="font-mono text-gray-900">
-            {fmt(finding.before)} → <span className="font-semibold">{fmt(finding.after)}</span>
+            <span title={finding.before_period ?? undefined}>
+              {fmt(finding.before)}
+            </span>
+            {" → "}
+            <span className="font-semibold" title={finding.after_period ?? undefined}>
+              {fmt(finding.after)}
+            </span>
           </div>
+          {(finding.before_period || finding.after_period) && (
+            <div className="text-[10px] text-gray-400 mt-0.5 font-mono">
+              {finding.before_period ?? "—"} → {finding.after_period ?? "—"}
+            </div>
+          )}
           <div className="text-xs text-gray-500 mt-1">
             Δ {fmtDelta(finding.delta)}
             {finding.z_score != null && <> &middot; z {fmtDelta(finding.z_score, 2)}</>}

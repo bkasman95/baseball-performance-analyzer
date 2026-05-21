@@ -53,6 +53,9 @@ class Anomaly:
     severity: Severity
     direction: Literal["improvement", "regression", "change"]
     confidence: Confidence
+    period: str | None = None       # human-readable time frame: "2023 → 2024" or "mid-2024"
+    before_period: str | None = None  # e.g. "2023"
+    after_period: str | None = None   # e.g. "2024"
     detail: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -67,6 +70,9 @@ class Anomaly:
             "severity": self.severity,
             "direction": self.direction,
             "confidence": self.confidence,
+            "period": self.period,
+            "before_period": self.before_period,
+            "after_period": self.after_period,
             "detail": self.detail,
         }
 
@@ -196,11 +202,25 @@ def detect_yoy_anomalies(
         pa, ip, pitches = _player_sample_for_season(role, latest_row)
         confidence = confidence_for_sample(role, pa=pa, ip=ip, pitches=int(pitches) if pitches else None)
 
+        latest_season = (
+            int(latest_row["__season"]) if pd.notna(latest_row.get("__season")) else None
+        )
+        prior_season = (
+            int(prior_row["__season"]) if pd.notna(prior_row.get("__season")) else None
+        )
+        before_period = str(prior_season) if prior_season is not None else None
+        after_period = str(latest_season) if latest_season is not None else None
+        period = (
+            f"{before_period} → {after_period}"
+            if before_period and after_period
+            else None
+        )
+
         anomalies.append(
             Anomaly(
                 metric=metric.name,
                 kind="year_over_year",
-                season=int(latest_row["__season"]) if pd.notna(latest_row.get("__season")) else None,
+                season=latest_season,
                 before=prior,
                 after=latest,
                 delta=delta,
@@ -208,6 +228,9 @@ def detect_yoy_anomalies(
                 severity=_severity_from_z(z),
                 direction=label_change(metric, prior, latest),
                 confidence=confidence,
+                period=period,
+                before_period=before_period,
+                after_period=after_period,
                 detail={
                     "z_player": z_player,
                     "z_league": z_league,
@@ -299,6 +322,12 @@ def detect_in_season_anomalies(
     }
     mapping = metric_col_for_outcome or (defaults_pitcher if role == "pitcher" else defaults_hitter)
 
+    # Build a parallel game_date series so we can map changepoint indices
+    # back to actual dates for human-readable period labels.
+    df_sorted = statcast_df.copy()
+    if "game_date" in df_sorted.columns:
+        df_sorted = df_sorted.sort_values("game_date")
+
     anomalies: list[Anomaly] = []
     for outcome_name, col in mapping.items():
         series = rolling_outcome_series(statcast_df, col, window=window)
@@ -307,6 +336,16 @@ def detect_in_season_anomalies(
         bkps = detect_changepoints(series)
         if not bkps:
             continue
+
+        # Parallel ordered series of dates (after the same dropna+sort) so we
+        # can label the changepoint with a real date.
+        dates = None
+        if "game_date" in df_sorted.columns:
+            dates = (
+                df_sorted.dropna(subset=[col])
+                .sort_values("game_date")["game_date"]
+                .reset_index(drop=True)
+            )
 
         # For each break, compute pre/post means and z against the surrounding window.
         s = series.dropna().reset_index(drop=True)
@@ -330,11 +369,32 @@ def detect_in_season_anomalies(
             metric = next((m for m in outcomes_for(role) if m.name == outcome_name), None)
             if metric is None:
                 continue
+
+            season = _season_of(statcast_df)
+            changepoint_date = None
+            before_period = None
+            after_period = None
+            period = None
+            if dates is not None and bk < len(dates):
+                try:
+                    changepoint_date = str(pd.to_datetime(dates.iloc[bk]).date())
+                    pre_start = pd.to_datetime(dates.iloc[max(0, bk - window)]).date()
+                    pre_end   = pd.to_datetime(dates.iloc[bk - 1]).date()
+                    post_start = pd.to_datetime(dates.iloc[bk]).date()
+                    post_end   = pd.to_datetime(dates.iloc[min(len(dates) - 1, bk + window - 1)]).date()
+                    before_period = f"{pre_start} – {pre_end}"
+                    after_period  = f"{post_start} – {post_end}"
+                    period = f"Within {season} season — shift on {changepoint_date}"
+                except Exception:
+                    pass
+            if period is None and season is not None:
+                period = f"Within {season} season — mid-season shift"
+
             anomalies.append(
                 Anomaly(
                     metric=outcome_name,
                     kind="changepoint",
-                    season=_season_of(statcast_df),
+                    season=season,
                     before=before,
                     after=after,
                     delta=delta,
@@ -342,8 +402,12 @@ def detect_in_season_anomalies(
                     severity=_severity_from_z(z),
                     direction=label_change(metric, before, after),
                     confidence="high" if len(s) >= SAMPLE.min_rolling_window * 3 else "low",
+                    period=period,
+                    before_period=before_period,
+                    after_period=after_period,
                     detail={
                         "changepoint_index": int(bk),
+                        "changepoint_date": changepoint_date,
                         "window": window,
                         "statcast_column": col,
                         "n_events": int(len(s)),
@@ -421,10 +485,19 @@ def detect_multivariate_anomaly(
     else:
         severity = "low"
 
+    # Best-effort season from the row; multivariate doesn't have an explicit
+    # before/after but we can still tag which season's profile we scored.
+    profile_season: int | None = None
+    if "__season" in player_row.index and not pd.isna(player_row["__season"]):
+        try:
+            profile_season = int(player_row["__season"])
+        except (TypeError, ValueError):
+            profile_season = None
+
     return Anomaly(
         metric="profile",
         kind="multivariate",
-        season=None,
+        season=profile_season,
         before=None,
         after=None,
         delta=None,
@@ -432,6 +505,7 @@ def detect_multivariate_anomaly(
         severity=severity,
         direction="change",
         confidence="high" if len(panel) >= 100 else "low",
+        period=f"Full {profile_season} season profile vs league" if profile_season else "Profile vs league",
         detail={
             "anomaly_score": anomaly_score,
             "iforest_raw_score": score,

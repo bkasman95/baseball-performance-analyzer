@@ -102,10 +102,18 @@ def _summarize_finding(role: Role, anomaly: A.Anomaly, causes: list[B.ProbableCa
     }.get(direction_word, "changed")
 
     if anomaly.kind == "year_over_year":
+        period_str = anomaly.period or "year over year"
         head = (
-            f"{anomaly.metric} {direction_phrase} from {_fmt(anomaly.before)} to "
-            f"{_fmt(anomaly.after)} year over year"
+            f"{anomaly.metric} {direction_phrase} from {_fmt(anomaly.before)} "
+            f"({anomaly.before_period or 'prior season'}) to "
+            f"{_fmt(anomaly.after)} ({anomaly.after_period or 'this season'})"
         )
+        # If we don't have season tags, fall back to the generic phrasing.
+        if not anomaly.before_period or not anomaly.after_period:
+            head = (
+                f"{anomaly.metric} {direction_phrase} from {_fmt(anomaly.before)} to "
+                f"{_fmt(anomaly.after)} {period_str}"
+            )
     elif anomaly.kind == "changepoint":
         head = (
             f"{anomaly.metric} {direction_phrase} mid-season, shifting from "

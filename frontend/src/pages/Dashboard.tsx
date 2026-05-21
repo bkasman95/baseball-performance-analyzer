@@ -261,18 +261,69 @@ function TrendsSection({
   season: number;
 }) {
   const topMetrics = uniqueMetrics(report.findings).slice(0, 4);
-  if (topMetrics.length === 0) return null;
+  const changepointFindings = report.findings.filter((f) => f.kind === "changepoint");
+
+  if (topMetrics.length === 0 && changepointFindings.length === 0) return null;
+
+  // Drive the X-axis range from the analyzed-seasons array so a sparse
+  // multi-year chart still shows all 6 years on the axis.
+  const seasonsAnalyzed = report.seasons_analyzed ?? [];
+  const seasonRange: [number, number] | undefined = seasonsAnalyzed.length
+    ? [Math.min(...seasonsAnalyzed), Math.max(...seasonsAnalyzed)]
+    : undefined;
 
   return (
-    <section>
-      <h2 className="text-xl font-semibold mb-3 text-gray-900">Trends</h2>
-      <div className="grid md:grid-cols-2 gap-4">
-        {topMetrics.map((metric) => (
-          <div key={metric} className="bg-white rounded-lg shadow p-4">
-            <SeasonTrend mlbamId={mlbamId} metric={metric} season={season} />
+    <section className="space-y-6">
+      {topMetrics.length > 0 && (
+        <div>
+          <h2 className="text-xl font-semibold mb-3 text-gray-900">
+            Year-over-year trends
+          </h2>
+          <p className="text-xs text-gray-500 mb-3">
+            One chart per anomaly metric. Red dashed line marks the analyzed
+            season ({season}).
+          </p>
+          <div className="grid md:grid-cols-2 gap-4">
+            {topMetrics.map((metric) => (
+              <div key={metric} className="bg-white rounded-lg shadow p-4">
+                <SeasonTrend
+                  mlbamId={mlbamId}
+                  metric={metric}
+                  season={season}
+                  seasonRange={seasonRange}
+                />
+              </div>
+            ))}
           </div>
-        ))}
-      </div>
+        </div>
+      )}
+
+      {changepointFindings.length > 0 && (
+        <div>
+          <h2 className="text-xl font-semibold mb-3 text-gray-900">
+            In-season changepoints
+          </h2>
+          <p className="text-xs text-gray-500 mb-3">
+            Rolling per-event chart for the analyzed season. Red dashed line
+            marks where the level shift was detected.
+          </p>
+          <div className="grid md:grid-cols-2 gap-4">
+            {changepointFindings.map((f, i) => (
+              <div key={`cp-${f.metric}-${i}`} className="bg-white rounded-lg shadow p-4">
+                <RollingTrend
+                  mlbamId={mlbamId}
+                  metric={f.metric}
+                  season={season}
+                  changepointDate={
+                    (f.detail?.["changepoint_date"] as string | undefined) ?? null
+                  }
+                  period={f.period}
+                />
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </section>
   );
 }
@@ -281,20 +332,64 @@ function SeasonTrend({
   mlbamId,
   metric,
   season,
+  seasonRange,
 }: {
   mlbamId: number;
   metric: string;
   season: number;
+  seasonRange?: [number, number];
 }) {
   const ts = useTimeseries(mlbamId, metric, { grain: "season" });
-  const data = (ts.data?.points ?? []).map((p) => ({ x: p.x, y: p.y }));
+  const data = (ts.data?.points ?? []).map((p) => ({
+    x: typeof p.x === "string" ? Number(p.x) || p.x : p.x,
+    y: p.y,
+  }));
+  const subtitle = seasonRange
+    ? `${seasonRange[0]} – ${seasonRange[1]}`
+    : undefined;
   return (
     <TrendChart
       title={`${metric} by season`}
+      subtitle={subtitle}
       data={data}
       changepointX={season}
+      changepointLabel={`${season}`}
+      xNumericDomain={seasonRange}
       emptyMessage={
         ts.isLoading ? "Loading…" : ts.data?.notes.length ? ts.data.notes.join(", ") : "No data."
+      }
+    />
+  );
+}
+
+function RollingTrend({
+  mlbamId,
+  metric,
+  season,
+  changepointDate,
+  period,
+}: {
+  mlbamId: number;
+  metric: string;
+  season: number;
+  changepointDate: string | null;
+  period: string | null;
+}) {
+  const ts = useTimeseries(mlbamId, metric, { grain: "rolling", season, window: 30 });
+  const data = (ts.data?.points ?? []).map((p) => ({ x: p.x, y: p.y }));
+  return (
+    <TrendChart
+      title={`${metric} — ${season} rolling`}
+      subtitle={period ?? undefined}
+      data={data}
+      changepointX={changepointDate ?? undefined}
+      changepointLabel={changepointDate ?? "changepoint"}
+      emptyMessage={
+        ts.isLoading
+          ? "Loading…"
+          : ts.data?.notes.length
+          ? ts.data.notes.join(", ")
+          : "No pitch-level data."
       }
     />
   );

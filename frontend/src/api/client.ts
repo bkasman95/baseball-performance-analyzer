@@ -92,6 +92,9 @@ export type AnomalyFinding = {
   severity: Severity;
   direction: ChangeDirection;
   confidence: Confidence;
+  period: string | null;
+  before_period: string | null;
+  after_period: string | null;
   detail: Record<string, unknown>;
   probable_causes: ProbableCause[];
   summary: string;
