@@ -14,7 +14,7 @@ import pandas as pd
 
 from app.data.cache import read_through_cache
 from app.data.pybaseball_setup import setup_pybaseball
-from app.data.retry import with_retry, TransientFetchError
+from app.data.retry import with_retry, classify_pybaseball_error
 
 
 log = logging.getLogger(__name__)
@@ -39,7 +39,7 @@ def _fetch_batting(season: int) -> pd.DataFrame:
         # qual=0 keeps everyone — we'll apply sample-size guardrails per-player downstream.
         df = batting_stats(season, season, qual=0)
     except Exception as e:
-        raise TransientFetchError(f"batting_stats({season}) failed: {e}") from e
+        raise classify_pybaseball_error(e) from e
     return df
 
 
@@ -51,7 +51,7 @@ def _fetch_pitching(season: int) -> pd.DataFrame:
     try:
         df = pitching_stats(season, season, qual=0)
     except Exception as e:
-        raise TransientFetchError(f"pitching_stats({season}) failed: {e}") from e
+        raise classify_pybaseball_error(e) from e
     return df
 
 

@@ -14,7 +14,7 @@ import pandas as pd
 
 from app.data.cache import read_through_cache
 from app.data.pybaseball_setup import setup_pybaseball
-from app.data.retry import with_retry, TransientFetchError
+from app.data.retry import with_retry, classify_pybaseball_error
 
 
 log = logging.getLogger(__name__)
@@ -36,7 +36,7 @@ def _fetch_statcast_pitcher(mlbam_id: int, start: str, end: str) -> pd.DataFrame
     try:
         return statcast_pitcher(start, end, mlbam_id)
     except Exception as e:
-        raise TransientFetchError(f"statcast_pitcher({mlbam_id}, {start}, {end}) failed: {e}") from e
+        raise classify_pybaseball_error(e) from e
 
 
 @with_retry
@@ -47,7 +47,7 @@ def _fetch_statcast_batter(mlbam_id: int, start: str, end: str) -> pd.DataFrame:
     try:
         return statcast_batter(start, end, mlbam_id)
     except Exception as e:
-        raise TransientFetchError(f"statcast_batter({mlbam_id}, {start}, {end}) failed: {e}") from e
+        raise classify_pybaseball_error(e) from e
 
 
 def get_statcast(

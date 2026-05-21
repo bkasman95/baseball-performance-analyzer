@@ -13,7 +13,7 @@ import pandas as pd
 
 from app.data.cache import read_through_cache
 from app.data.pybaseball_setup import setup_pybaseball
-from app.data.retry import with_retry, TransientFetchError
+from app.data.retry import with_retry, classify_pybaseball_error
 from app.data.savant import fetch_savant_leaderboard, SavantBoard
 
 
@@ -47,7 +47,7 @@ def _fetch_pybaseball_board(kind: LeaderboardKind, season: int) -> pd.DataFrame:
         if kind == "pitcher_arsenal":
             return pb.statcast_pitcher_arsenal_stats(year=season)
     except Exception as e:
-        raise TransientFetchError(f"{kind}({season}) failed: {e}") from e
+        raise classify_pybaseball_error(e) from e
     return pd.DataFrame()
 
 
