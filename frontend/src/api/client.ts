@@ -236,6 +236,42 @@ export async function refreshPlayer(
 }
 
 // ---------------------------------------------------------------------------
+// Analysis history (per-user query log)
+// ---------------------------------------------------------------------------
+
+export type HistoryStatus = "running" | "complete" | "failed" | "stale";
+
+export type HistoryRow = {
+  id: number;
+  player_id: number;
+  player_name: string | null;
+  season: number;
+  status: HistoryStatus;
+  cache_hit: boolean;
+  job_id: string | null;
+  created_at: string;
+  completed_at: string | null;
+  duration_ms: number | null;
+  response_size_bytes: number | null;
+  error: string | null;
+};
+
+export type HistoryResponse = {
+  rows: HistoryRow[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
+export async function getHistory(opts?: { limit?: number; offset?: number }): Promise<HistoryResponse> {
+  return (
+    await api.get<HistoryResponse>("/api/me/history", {
+      params: { limit: opts?.limit ?? 50, offset: opts?.offset ?? 0 },
+    })
+  ).data;
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

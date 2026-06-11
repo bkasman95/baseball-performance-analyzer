@@ -35,7 +35,7 @@ def pytest_unconfigure(config):
 def _reset_db_and_cache():
     # Import lazily so env vars are set first.
     from app.db import Base, engine
-    from app.models import cache_entry, user, saved_analysis  # noqa: F401
+    from app.models import cache_entry, user, saved_analysis, analysis_history  # noqa: F401
 
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)

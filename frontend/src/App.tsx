@@ -3,6 +3,7 @@ import { Link, Routes, Route, useNavigate } from "react-router-dom";
 import { useAuth } from "./api/AuthContext";
 import ProtectedRoute from "./components/ProtectedRoute";
 import Health from "./pages/Health";
+import History from "./pages/History";
 import Search from "./pages/Search";
 import Dashboard from "./pages/Dashboard";
 import Login from "./pages/Login";
@@ -31,6 +32,14 @@ export default function App() {
               </ProtectedRoute>
             }
           />
+          <Route
+            path="/history"
+            element={
+              <ProtectedRoute>
+                <History />
+              </ProtectedRoute>
+            }
+          />
         </Routes>
       </main>
       <footer className="text-center text-xs text-gray-500 py-4">
@@ -52,6 +61,9 @@ function Header() {
         </Link>
         <nav className="text-sm space-x-4 opacity-90 flex items-center">
           <Link to="/" className="hover:underline">Search</Link>
+          {isAuthenticated && (
+            <Link to="/history" className="hover:underline">History</Link>
+          )}
           <Link to="/health" className="hover:underline">Health</Link>
           {isAuthenticated && user ? (
             <>

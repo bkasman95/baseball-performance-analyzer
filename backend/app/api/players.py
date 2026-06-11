@@ -39,7 +39,9 @@ from app.data import (
 from app.data.aggregates import get_league_season
 from app.data.cache import invalidate
 from app.data.players import get_player_by_mlbam
+from app.history import record_cache_hit, start_history_row, wrap_job_for_history
 from app.jobs.registry import get_registry
+from app.models.user import User
 
 
 log = logging.getLogger(__name__)
@@ -160,6 +162,7 @@ def get_analysis(
     response: Response,
     season: int | None = Query(None, description="Defaults to last season the player appeared"),
     seasons_window: int | None = Query(None, ge=2, le=15),
+    user: User = Depends(get_current_user),
 ) -> dict:
     """Run (or fetch) the full analysis report.
 
@@ -170,6 +173,9 @@ def get_analysis(
         `status_url` to poll.
       * If a job for the same key is already in flight, the registry returns
         that one — the client never starts duplicates.
+
+    Every call also writes one row to `analysis_history` so the user can see
+    their past queries with timing and response size.
     """
     settings = get_settings()
     # Fast lookup — role detection happens inside the background job so this
@@ -189,14 +195,30 @@ def get_analysis(
 
     existing = registry.get_by_key(key)
     if existing is not None and existing.status == "complete":
+        record_cache_hit(
+            user_id=user.id, player_id=mlbam_id, player_name=p.full_name,
+            season=season, job_id=existing.id, result=existing.result,
+        )
         return {"status": "ok", "report": existing.result, "job_id": existing.id}
+
+    # Cache miss: create the history row now (status=running) and update it
+    # from inside the job runner when it finishes.
+    history_id = start_history_row(
+        user_id=user.id, player_id=mlbam_id, player_name=p.full_name, season=season,
+    )
 
     job = registry.submit(
         key=key,
         kind="analysis",
-        fn=lambda: _run_analysis_with_role_detection(mlbam_id, season, sw),
+        fn=wrap_job_for_history(
+            history_id, lambda: _run_analysis_with_role_detection(mlbam_id, season, sw)
+        ),
         meta={"player_id": mlbam_id, "season": season, "seasons_window": sw},
     )
+
+    # Backfill the job_id onto the history row now that we have it.
+    from app.history import attach_job_id
+    attach_job_id(history_id, job.id)
 
     response.status_code = 202
     return AnalysisAccepted(
